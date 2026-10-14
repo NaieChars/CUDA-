@@ -1,0 +1,1 @@
+add_subdirectory(day04_coalescing)

@@ -1,0 +1,64 @@
+# =========================
+# Build / generated files
+# =========================
+build/
+cmake-build-*/
+out/
+bin/
+obj/
+result/
+
+# Visual Studio / CMake user state
+.vs/
+*.suo
+*.user
+CMakeUserPresets.json
+
+# CUDA / compiler generated artifacts
+*.obj
+*.o
+*.lib
+*.dll
+*.exe
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.ipdb
+*.iobj
+*.tlog
+*.res
+*.rsp
+*.cubin
+*.ptx
+*.fatbin
+
+# Nsight / profiler reports
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Logs / temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*.d
+
+# Benchmark / profiler outputs
+# Keep the directory placeholder, ignore generated contents.
+results/*
+!results/.gitkeep
+
+# Python cache, in case helper scripts are added later
+__pycache__/
+*.py[cod]
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE-local files
+.idea/
+*.code-workspace
