@@ -119,3 +119,38 @@ __global__ void transpose_matrix_tiling_32x8(
         }
     }
 }
+
+// 分支：循环 Tiling 4096 x 4096 去掉边界判断，对比指令数与平均耗时
+__global__ void transpose_matrix_tiling_32x8__without_condition(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int row,
+    int col)
+{
+    __shared__ float tile[TILE][TILE + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int c = blockIdx.x * TILE + tx;
+    const int r = blockIdx.y * TILE + ty;
+
+    // 连续读取：每个线程负责 4 行
+    #pragma unroll
+    for (int j = 0; j < TILE; j += BLOCK_ROWS)
+    {
+            tile[ty + j][tx] = in[static_cast<size_t>(r + j) * col + c];
+    }
+
+    __syncthreads();
+
+    const int out_c = blockIdx.x * TILE + ty;
+    const int out_r = blockIdx.y * TILE + tx;
+
+    // 转置后连续写入
+    #pragma unroll
+    for (int j = 0; j < TILE; j += BLOCK_ROWS)
+    {
+            out[static_cast<size_t>(out_c + j) * row + out_r] = tile[tx][ty + j];
+    }
+}

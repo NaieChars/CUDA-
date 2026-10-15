@@ -26,7 +26,7 @@ $kernels = @(
     @{mode=0; name="copy"; kernel="normal_copy"; block=$null}
     @{mode=2; name="transpose_naive"; kernel="transpose_matrix"; block=$null}
     @{mode=3; name="transpose_tiling"; kernel="transpose_matrix_tiling"; block="32x32"}
-    @{mode=4; name="transpose_tiling_loop"; kernel="transpose_matrix_tiling_32x8"; block="32x8"}
+    @{mode=4; name="transpose_tiling_loop"; kernel="transpose_matrix_tiling_32x8__without_condition"; block="32x8"} # 临时修改核函数名
 )
 $tests = @(foreach ($case in $cases) {
     foreach ($kernel in $kernels) {

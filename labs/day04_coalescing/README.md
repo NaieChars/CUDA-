@@ -1,76 +1,348 @@
-# 矩阵转置性能分析
+# Day04：合并访存与矩阵转置性能分析
 
-## 1. 朴素方案与 Tiling 方案性能指标对比与分析
+本实验以 `4096 × 4096` 的 `float` 矩阵转置为主线，学习如何把线程访问模式、硬件指标和实际耗时联系起来。优化过程包括朴素转置、shared memory tiling、线程循环、BLOCK_ROWS 扫描，以及去掉边界判断的对照实验。
 
-**实验对象：**
-- **朴素方法**：矩阵 4096 x 4096，block 256
-- **Tiling方法**：矩阵 4096 x 4096，Tile 32
+**阶段结论：** 带边界判断的 `32 × 8` 循环版在完整对比批次中达到 **303.98 GB/s**，约为同批次 copy 基线的 **99.05%**，相对朴素版加速约 **1.72 倍**。删除边界判断进一步减少了指令数，但没有观察到明确的性能收益。本实验在此收尾，保留尚未验证的解释，不继续追逐小幅性能差异。
 
-**实验设置说明：**
-实验包含 10 次预热，ncu 捕获第 11 次的数据；同时为了避免 ncu 带来的时间拉伸，先不带 ncu 跑一次程序，获得准确的运行时间与有效带宽。
+## 1. 实验环境与实现
 
----
+| 项目 | 设置 |
+| :--- | :--- |
+| GPU | NVIDIA GeForce RTX 5060 Laptop GPU |
+| 显存理论峰值带宽 | 384 GB/s（本实验采用的标称参考值） |
+| 构建与运行 | Windows，Release |
+| 数据类型与布局 | `float`，行优先 |
+| 主要矩阵尺寸 | 输入 `4096 × 4096`，输出同尺寸 |
+| 输入初始化 | `cudaMemset` 为零 |
+| Tiled 共享数组 | `float tile[32][33]`，包含一列 padding |
 
-### 1.1 朴素方法
+| 实现 | 线程组织 | 工作方式 |
+| :--- | :--- | :--- |
+| Copy | 256 threads/block | 连续读、连续写，作为实际带宽参照 |
+| 朴素转置 | 256 threads/block | 每线程一个元素，输入分散读、输出连续写 |
+| Tiled | `32 × 32` threads/block | 每线程一个元素，通过 shared memory 交换数据，实现合并读写 |
+| 循环 tiled | `32 × 8` threads/block | 每线程处理四个元素，仍覆盖一个 `32 × 32` tile |
+| 循环 tiled，无边界判断 | `32 × 8` threads/block | 删除循环中的输入、输出边界条件，保持转置映射不变 |
 
-#### 运行上下文 (Context)
-> **Mode C** | `row=4096` | `col=4096` | `block=256` | **time=0.6919 ms** | **Effective bandwidth=194.00 GB/s**
+源码见 [main.cu](src/main.cu)、[kernels.cu](src/kernels.cu)。朴素版按输出坐标遍历，输出形状是 `col × row`，因此输出行号使用 `idx / row`，列号使用 `idx % row`
 
-#### 性能指标详情 (Metrics)
+带判断的两个 tiled 内核从索引上支持边缘 tile；无判断版仅用于行列均为 32 整倍数的完整 tile。本实验没有记录非零输入的 CPU 对照验证结果，因此性能数据不能替代正确性验证。
 
-| Metric Name | Metric Unit | Metric Value |
-| :--- | :---: | ---: |
-| `dram__bytes_op_read.sum` | Mbyte | 67.11 |
-| `dram__bytes_op_write.sum` | Mbyte | 66.02 |
-| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | % | 36.66 |
-| `gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed` | % | 70.31 |
-| `gpu__time_duration.sum` | ms | 1.03 |
-| `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` | - | 524,288 |
-| `l1tex__t_requests_pipe_lsu_mem_global_op_st.sum` | - | 524,288 |
-| `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` | sector | 16,777,216 |
-| `l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum` | sector | 2,097,152 |
-| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | % | 18.70 |
-| `sm__warps_active.avg.pct_of_peak_sustained_active` | % | 83.52 |
-| `smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio` | inst | 27.02 |
+## 2. 测量方法与数据来源
 
----
+### 2.1 普通计时与 ncu 分开进行
 
-### 1.2 Tiling 方法
+普通运行使用 [CudaTimer](../../common/include/cuda_timer.cuh)：先预热 10 次并同步，再用 CUDA events 测量连续 100 次 kernel 的总时间，除以 100，得到一次程序运行的平均耗时。内存分配和输入初始化在计时区间之外。
 
-#### 运行上下文 (Context)
-> **Mode D (Tiled)** | `row=4096` | `col=4096` | `TILE=32` | **time=0.6246 ms** | **Effective bandwidth=214.88 GB/s**
+脚本启动程序 10 次，分别对这 10 个平均耗时、有效带宽取算术平均。文中的时间标准差是这 10 个程序运行结果的样本标准差，不能把它们看作 1000 个独立的 kernel 样本。
 
-#### 性能指标详情 (Metrics)
+ncu 也独立启动程序 10 次，每次用 `--launch-skip 10 --launch-count 1` 捕获所选 kernel 的第 11 次启动，并保留报告、CSV 和日志。同一 kernel、指标、单位分别平均，缺失或无效值不会被当作零。
 
-| Metric Name | Metric Unit | Metric Value |
-| :--- | :---: | ---: |
-| `dram__bytes_op_read.sum` | Mbyte | 67.12 |
-| `dram__bytes_op_write.sum` | Mbyte | 62.74 |
-| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | % | 43.37 |
-| `gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed` | % | 43.37 |
-| `gpu__time_duration.sum` | us | 851.39 |
-| `l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum` | - | 524,288 |
-| `l1tex__t_requests_pipe_lsu_mem_global_op_st.sum` | - | 524,288 |
-| `l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum` | sector | 2,097,152 |
-| `l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum` | sector | 2,097,152 |
-| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | % | 26.81 |
-| `sm__warps_active.avg.pct_of_peak_sustained_active` | % | 63.95 |
-| `smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio` | inst | 13.68 |
+普通运行用于判断实际性能；ncu 用于解释硬件行为。ncu 的缓存清理、频率控制和 replay 会改变测量条件，不能将两类时间直接混用，也不能把 ncu 时间差全部归因于工具开销。[NVIDIA 测量说明](https://docs.nvidia.com/nsight-compute/ProfilingGuide/#range-and-precision)
 
----
+### 2.2 带宽口径
 
-### 1.3 分析与结论
+本章的 copy 和转置均按有效读取一次、写入一次计算：
 
-- 朴素方法的全局读取存在明显的非合并访存，Load Sectors/Request 达到 32；Tiling 方法将其降至 4，与理想的连续访问模式一致。两种方法的写入均为 4，说明它们的写入访问合并情况基本相同。
-- 针对朴素方法的**DRAM吞吐量和内存吞吐量**，内存吞吐量70.31%远大于DRAM吞吐量36.66%，这说明朴素方法的读取合并效率很差，L1TEX 层的访问请求数量明显膨胀。这与请求在显存接口之前的某个环节消耗了更多资源的解释相符，但还需要进一步查看 L1TEX、L2 等单元的吞吐细分才能确认。针对Tiling方法，DRAM吞吐量和内存吞吐量相等，Long Scoreboard 下降了约50%，这说明Tiling 减少了低效率的全局内存访问，并且伴随着内存相关等待减少。
--  优化后 DRAM 仍未达到持续峰值。当前表现可能同时受到访存延迟、可并发在途请求数量、SM 执行效率以及额外指令开销的影响，尚不能确定唯一瓶颈。
-- 平均耗时并无太大提升的原因可能在于：同步线程存在开销；然后可能存在SM内部的指令数量变多，额外的存入和读取共享内存，以及同步指令，同时kernel里的索引计算变复杂了，这也许也是sm吞吐量增加的原因
-- Occupancy 下降，`sm__warps_active` 从 83.52% 到 63.95%。在朴素方法下，block = 256，5060 一个 SM 的最大线程数为 1536（48 warp），此时一个 SM 可容纳的最大 block = 6，该条件下一个 block 里有 8 个 warp，一共可容纳 48 warp，理论上的 occupancy 为 100%，这里是 80% 可能由于其他原因。Tiling = 32 方法下，一个 block 线程数为 1024（32 个 warp），一个 SM 最多只能容纳 1 个 block，实际的 occupancy 只有 32/48 = 66.67%，这应该就是占用率下降的主要原因。
+```text
+N = 4096 × 4096 = 16,777,216
+单个矩阵 = N × sizeof(float) = 67,108,864 byte = 64 MiB
+有效数据量 = 2 × N × sizeof(float) = 134,217,728 byte
+有效带宽 GB/s = 有效数据量 / (time_ms / 1000) / 10^9
+```
 
----
+有效带宽衡量完成算法有效工作的速度，不等于 DRAM 硬件计数中的实际流量。平均带宽是每次带宽的算术平均，不严格等于“有效数据量 / 平均时间”。加速比统一由平均时间计算。
 
-> 以上就是我在加入几个新指标前写的一个对几个重要指标的一些对比与分析与猜测，已经在上一个对话让gpt分析过了。
->
-> 用到的命令行指令：  
-> ncu --import .\.\labs\day04_coalescing\result\transpose_4096_4096_b256.ncu-rep --page details
-> powershell -ExecutionPolicy Bypass -File .\labs\day04_coalescing\scripts\run_ncu.ps1（对于朴素方法，对应命令行参数是2，tilinga 方法是3，在命令行脚本修改）
+原实验 B（stride write）仍使用单方向带宽口径，未纳入本章的转置对比。
+
+### 2.3 两个批次分别保留
+
+| 批次 | 数据目录 | 内容 |
+| :--- | :--- | :--- |
+| A：2026-10-14 | [20261014_090513_882](result/20261014_090513_882/) | Copy、朴素、32×32 tiled、带判断的 32×8 循环版完整对比 |
+| B：2026-10-14 | [20261014_210917_288](result/20261014_210917_288/) | 最新一次完整运行；mode 4 改为无边界判断版，其余三种实现也重新测量 |
+| BLOCK_ROWS 扫描 | [性能指标汇总](docs/性能指标汇总.md) | 4、8、16 的普通平均耗时，未采 ncu 指标 |
+
+下面用 A 分析主要优化过程，用 B 记录最新结果和无判断实验；不将两个批次拼成一次严格的同条件对照。早期单次测试已被这些重复测试替代，不参与主要加速比计算。
+
+## 3. 普通运行结果
+
+### 3.1 批次 A：主要优化过程
+
+| 方法 | 平均耗时 ms | 时间中位数 ms | 时间标准差 ms | 平均有效带宽 GB/s |
+| :--- | ---: | ---: | ---: | ---: |
+| Copy | 0.43753 | 0.43310 | 0.01038 | 306.908 |
+| 朴素转置 | 0.76034 | 0.76285 | 0.02386 | 176.679 |
+| 32×32 tiled | 0.64072 | 0.63275 | 0.01419 | 209.571 |
+| 32×8 循环 tiled，有判断 | **0.44156** | **0.44100** | **0.00429** | **303.982** |
+
+循环版相对朴素版加速约 **1.72 倍**；相对 32×32 tiled 加速约 **1.45 倍**，耗时下降 **31.08%**。这两项改善明显大于本批次的波动。
+
+循环版与 copy 的平均时间只差约 `4.03 μs`，平均带宽达到 copy 的 **99.05%**。这一差距较小，结论是“性能接近 copy”，不对几微秒的差值作精确归因。Copy 是实际参照，不是严格不可超越的上限。
+
+按 384 GB/s 的标称值，copy 和循环转置的有效带宽分别约为峰值的 79.92%、79.16%。这与 ncu 的 DRAM throughput 百分比口径不同。
+
+### 3.2 批次 B：最新一次完整运行
+
+| 方法 | 平均耗时 ms | 时间中位数 ms | 时间标准差 ms | 平均有效带宽 GB/s |
+| :--- | ---: | ---: | ---: | ---: |
+| Copy | 0.45526 | 0.46115 | 0.01721 | 295.215 |
+| 朴素转置 | 0.79100 | 0.78225 | 0.03920 | 170.059 |
+| 32×32 tiled | 0.67351 | 0.65335 | 0.04302 | 199.990 |
+| 32×8 循环 tiled，无判断 | **0.44430** | **0.44510** | **0.00325** | **302.115** |
+
+本批次无判断版的平均带宽略高于 copy，并不与其作为参照矛盾。脚本按实现分组连续测量，不同实现处在不同时间段；两批次的 copy、朴素和 tiled 时间也有变化，因此不能据此认定无判断转置稳定快于 copy。
+
+## 4. 分析一：Tiling 改善了哪一级访问？
+
+### 4.1 用线程访问模式预测 sectors/request
+
+对本实验满 warp、每线程访问一个 `float` 的情况，32 个线程需要 128 byte。连续且对齐的访问覆盖四个 32-byte sector；朴素转置中，读取地址跨行分散，一个 warp 覆盖 32 个 sector。
+
+批次 A 的计数与源码预测一致：
+
+| 指标 | Copy | 朴素 | 32×32 tiled | 32×8 循环 |
+| :--- | ---: | ---: | ---: | ---: |
+| 全局读 requests | 524,288 | 524,288 | 524,288 | 524,288 |
+| 全局读 sectors | 2,097,152 | 16,777,216 | 2,097,152 | 2,097,152 |
+| 全局读 sectors/request | 4 | **32** | **4** | **4** |
+| 全局写 requests | 524,288 | 524,288 | 524,288 | 524,288 |
+| 全局写 sectors | 2,097,152 | 2,097,152 | 2,097,152 | 2,097,152 |
+| 全局写 sectors/request | 4 | 4 | 4 | 4 |
+
+**已证实：**朴素版的读访问不合并，写访问已合并；tiling 改善了读取。
+
+这里的 request/sectors 使用 `l1tex__t_requests_pipe_lsu_mem_global_op_{ld,st}.sum` 和 `l1tex__t_sectors_pipe_lsu_mem_global_op_{ld,st}.sum`。
+
+### 4.2 Sector 计数改善八倍，为什么耗时没有改善八倍？
+
+| 批次 A 的指标 | Copy | 朴素 | 32×32 tiled | 32×8 循环 |
+| :--- | ---: | ---: | ---: | ---: |
+| DRAM 读取 MB | 67.203 | 69.594 | 67.623 | 67.126 |
+| DRAM 写入 MB | 60.673 | 60.878 | 59.581 | 50.951 |
+| L1 sector 命中率 % | 0.000 | 4.577 | 0.000 | 0.000 |
+| L2 sector 命中率 % | 0.010 | **76.470** | 0.014 | 0.010 |
+
+各版 DRAM 读取量接近一个矩阵的大小，没有相差八倍。朴素版较高的 L2 命中率，支持不同请求重复触达相同 sector、部分流量被缓存接住的解释；这是硬件层面的重复访问，不意味着算法本身需要重复读取每个元素。
+
+因此，L1TEX sector 计数不能直接等同于唯一数据量或 DRAM 流量。高缓存命中率也不能单独代表算法更高效：朴素版命中率更高，却仍然更慢。
+
+实际 DRAM 写入小于 67.109 MB 不直接证明漏写。部分输出可能在测量结束时仍留在 L2、尚未回写；计数还受采集条件影响。这里把它作为可能解释，没有验证具体差额的来源。DRAM 字节数应由硬件行为解释，不能仅按算法输出大小推导。[NVIDIA 对缓存与 DRAM 计数的说明](https://forums.developer.nvidia.com/t/question-about-gpu-l2-cache-memory-access/276324)
+
+## 5. 分析二：瓶颈如何随优化迁移？
+
+### 5.1 吞吐、调度与指令指标
+
+以下均为批次 A 的 10 次 ncu 算术平均：
+
+| 指标 | Copy | 朴素 | 32×32 tiled | 32×8 循环 |
+| :--- | ---: | ---: | ---: | ---: |
+| L1TEX throughput % | 29.894 | **94.260** | 20.252 | 39.272 |
+| L2 throughput % | 24.771 | 69.672 | 13.639 | 30.771 |
+| DRAM throughput % | 82.182 | 35.595 | 42.807 | **89.857** |
+| Memory throughput % | 82.182 | 69.672 | 42.807 | 89.857 |
+| SM throughput % | 32.638 | 18.523 | 27.004 | 35.347 |
+| Achieved occupancy % | 76.889 | 83.510 | 63.933 | **93.688** |
+| Eligible warps | 0.158 | 0.310 | 0.842 | 0.640 |
+| Issue active % | 13.053 | 18.523 | 19.831 | 29.949 |
+| 总 warp 指令数 | 8,388,608 | 28,311,552 | 24,641,536 | 15,990,889.1 |
+| Long Scoreboard ratio | 56.084 | 27.200 | 13.802 | 23.543 |
+| Barrier ratio | 0.000 | 0.000 | 4.473 | 6.173 |
+| Short Scoreboard ratio | 4.112 | 5.308 | 2.179 | 0.711 |
+
+小数指令数来自多次计数的平均，不是单次执行了非整数条指令。循环版九次为 15,990,784，一次略高。
+
+**主要解释：**
+
+1. 朴素版读 sectors/request 为 32，同时 L1TEX throughput 达 94.26%，强烈支持分散读取对 L1TEX 造成很大压力。
+2. 32×32 tiled 消除了这类低效率全局读取，但 DRAM throughput 只有约 42.81%；改善合并访问后，仍有其他执行限制。
+3. 循环版保持相同的合并读写，提高驻留并发、减少总指令工作，DRAM throughput 提高到约 89.86%，普通运行也接近 copy。
+
+据此推断，循环版主要接近 DRAM 侧吞吐限制；尚未证明这是唯一限制，也不能据 89.86% 精确计算还能加速多少。
+
+Throughput 表示相关硬件单元相对于持续峰值的利用程度，不是缓存命中率或总时间占比。汇总项由其组成指标中的最大百分比主导，并非各层百分比相加；Memory throughput 与 DRAM throughput 相等，本身不足以证明显存带宽受限。[NVIDIA 指标结构说明](https://docs.nvidia.com/nsight-compute/ProfilingGuide/#metrics-structure)
+
+### 5.2 为什么 32×32 的 occupancy 低？
+
+| 批次 A 的资源指标 | 32×32 tiled | 32×8 循环 |
+| :--- | ---: | ---: |
+| threads/block | 1,024 | 256 |
+| warps/block | 32 | 8 |
+| registers/thread | 18 | 26 |
+| shared memory 配置 byte | 8,192 | 65,536 |
+| shared memory 分配 byte/block | 5,248 | 5,248 |
+| occupancy limit：blocks | 24 | 24 |
+| occupancy limit：registers | 2 | 8 |
+| occupancy limit：shared memory | 1 | 12 |
+| occupancy limit：warps | 1 | 6 |
+| 综合理论驻留上限 block/SM | **1** | **6** |
+
+每 SM 最多 48 warp，理论 occupancy 为：
+
+```text
+32×32：1 block × 32 warp / 48 = 66.67%
+32×8 ：6 block ×  8 warp / 48 = 100%
+```
+
+这与实际约 63.93%、93.69% 相符。原版同时受到 warps 和当前 shared 配置的一 block 限制，不能把原因全部归于线程数。两版每 block 的 shared 分配相同，但启动时配置的容量不同。
+
+循环版寄存器从 18 增至 26，并未成为最终驻留限制。这里不需要为降低寄存器数而强行限制分配。Occupancy 衡量驻留情况，eligible 衡量就绪情况，二者不能互相替代；高 occupancy 也不保证高性能。
+
+### 5.3 循环为什么能减少总工作？
+
+两版都处理 16,384 个 tile：
+
+```text
+32×32：每 tile 32 warp，每 warp 读一次、写一次
+32×8 ：每 tile  8 warp，每 warp 读四次、写四次
+```
+
+因此总全局内存 request 数不变，但每线程做更多工作，可以摊薄部分地址计算、控制和同步相关工作。典型指令计数为：
+
+```text
+32×32：每 warp 47 条，处理 32 个元素；每 tile 1,504 条 warp 指令
+32×8 ：每 warp 122 条，处理 128 个元素；每 tile 976 条 warp 指令
+```
+
+完成同一矩阵所需的总 warp 指令减少约 35.1%。确切减少了哪些指令，仍需 SASS 对照，不能仅凭源码逐行统计。
+
+这也修正了早期猜测：加入 shared 读写和同步，并不意味着总指令数一定增加。朴素版的索引计算可能更贵，但具体原因尚未反汇编验证。
+
+### 5.4 Padding 与 shared wavefront
+
+| 批次 A 的 shared 指标 | 32×32 tiled | 32×8 循环 |
+| :--- | ---: | ---: |
+| 读 wavefront | 546,537.8 | 526,170.8 |
+| 写 wavefront | 612,599.3 | 524,288 |
+| 读 bank-conflict 计数 | 22,249.8 | 1,882.8 |
+| 写 bank-conflict 计数 | 88,311.3 | 0 |
+
+按本内核满 warp、标量 shared 访问的预期，每个方向的 wavefront 基数为 524,288。循环版读计数比基数多约 0.36%，写计数达到基数。
+
+当前 `tile[32][33]` 的索引按传统 bank 映射可避免规则的列访问冲突；计数中的剩余增量没有进一步定位。现有结果不支持把 residual bank conflict 认定为主要瓶颈，也不能把 wavefront 减少比例直接换算成总耗时收益。本章不继续深挖 padding。
+
+## 6. BLOCK_ROWS 扫描
+
+保持 TILE=32，分别调整启动 block 和内核循环步长；这组实验只记录普通平均耗时：
+
+| BLOCK_ROWS | threads/block | 每线程元素数 | 平均耗时 ms | 相对 8 的耗时增幅 |
+| ---: | ---: | ---: | ---: | ---: |
+| 4 | 128 | 8 | 0.451870 | 2.58% |
+| **8** | **256** | **4** | **0.440510** | — |
+| 16 | 512 | 2 | 0.446190 | 1.29% |
+
+**观察：**8 在本组测试中最好，作为后续基线。该组没有记录逐次波动和 ncu 指标，因此不把这几个百分点的差异归因于某个特定资源限制，也不宣称 8 对所有尺寸和设备都最优。
+
+更多每线程工作可能减少重复指令，也可能增加寄存器需求；更多线程也不必然更快。BLOCK_ROWS 的选择是这些因素的折中。
+
+## 7. 删除边界判断：指令减少，性能是否改善？
+
+无判断版只删除循环中的边界条件，保留相同的全局与 shared 映射。对完整的 4096² 矩阵，两版执行相同的元素搬运。
+
+| 指标 | 有判断：批次 A | 无判断：批次 B |
+| :--- | ---: | ---: |
+| 普通平均时间 ms | 0.44156 | 0.44430 |
+| 普通平均带宽 GB/s | 303.982 | 302.115 |
+| ncu 平均时间 ms | 0.373667 | 0.501562 |
+| ncu 时间中位数 ms | 0.375184 | 0.379872 |
+| warp 指令数 | 15,990,889.1 | 9,961,472 |
+| registers/thread | 26 | 26 |
+| Achieved occupancy % | 93.688 | 93.467 |
+| DRAM throughput % | 89.857 | 87.835 |
+| Long Scoreboard ratio | 23.543 | 39.555 |
+| Barrier ratio | 6.173 | 9.604 |
+| Short Scoreboard ratio | 0.711 | 1.275 |
+| Issue active % | 29.949 | 18.030 |
+| Eligible warps | 0.640 | 0.399 |
+
+### 7.1 已观察到的变化
+
+总指令数下降约 **37.7%**，寄存器、shared 配置、理论驻留限制没有改变；全局请求与 sector 计数也不变。
+
+普通平均时间只增加约 **0.62%**，若与 BLOCK_ROWS 扫描中 8 的结果比较则约增加 0.86%。这些数据来自不同测试批次，且差异与已有波动接近，因此结论是：**删除判断没有测得明确收益，尚不能认定存在稳定退化。**
+
+ncu 的 0.501562 ms 平均值包含一次 1.596832 ms 的异常，不能解释为稳定变慢了约 34%，详见下一节。
+
+### 7.2 等待 ratio 上升，不能直接推导实际延迟增加
+
+本实验采集的是 `smsp__average_warps_issue_stalled_*_per_issue_active.ratio`。这些是按发射活动归一化的等待指标，不是总运行时间百分比，也不是单次访存延迟。
+
+删除指令后，分母也会变化。用指令量做数量级上的交叉检查：新指令数约为原来的 62.3%，若等待负担基本不变，每条发射指令对应的等待量可能放大约 `1 / 0.623 = 1.605` 倍；观察到 Long Scoreboard ratio 放大约 1.68 倍、Barrier ratio 放大约 1.56 倍，与这一量级相近。
+
+这只是归一化影响的示意，不能用平均 ratio 乘平均指令数精确还原总等待周期。原始等待、发射计数及具体调度仍未直接对照。[NVIDIA Warp State 说明](https://docs.nvidia.com/nsight-compute/ProfilingGuide/#sections-and-rules)
+
+**合理但未验证的解释：**被删除的比较、谓词和控制指令不在主要关键路径上，原本与内存等待部分重叠；删除后指令少了，等待更显眼，总完成时间却接近。编译器调度也可能变化，需 SASS 才能确认。
+
+因此，不采用“等待变长导致最终变慢”作为定论。保留当前实验结果，不再进行交替运行验证。
+
+## 8. 异常样本与测量限制
+
+| 样本 | 异常时间 | 其他样本或中位数 | 对分析的影响 |
+| :--- | ---: | :--- | :--- |
+| A：朴素版 ncu 第 9 次 | 2.319424 ms | 其余九次平均约 1.030201 ms；中位数 1.030176 ms | 将十次均值拉高到 1.159123 ms |
+| B：无判断版 ncu 第 7 次 | 1.596832 ms | 其余九次平均约 0.379865 ms；中位数 0.379872 ms | 将十次均值拉高到 0.501562 ms |
+
+原始样本和包含全部样本的均值均保留。“其余九次”只用于解释异常影响，不替代十次统计，也未确定异常根因。早期单次循环版 ncu 的 1.32 ms 未在 A 的重复测试中重现，不作为代表性能。
+
+其他分析边界：
+
+- 普通计时和 ncu 是独立运行，缓存状态、频率和采样范围可能不同；默认 replay 前的缓存清理也会影响命中率。
+- 脚本按方法分组测量，未交替运行；跨批次微小差异不作因果归因。
+- 没有记录足够的时钟、功耗和其他 GPU 活动数据，不能确定异常由频率、系统调度还是其他因素引起。
+- 当前输入全零，没有记录非零数据回读验证；这属于实验覆盖范围的限制，不等于已发现索引错误。
+- 本章结论面向当前设备、4096² 尺寸和测试方式，不直接推广到所有矩阵大小。
+
+## 9. 复现入口与当前代码状态
+
+从仓库根目录运行，需已配置 CUDA 与主机编译工具：
+
+```powershell
+cmake -S . -B build
+cmake --build build --config Release --target day04_coalescing
+powershell -ExecutionPolicy Bypass -File .\labs\day04_coalescing\scripts\run_ncu.ps1
+```
+
+脚本读取已有 Release exe，不会自动构建；修改源码后先重新构建。每次脚本运行创建独立时间戳目录，保留每次 `.ncu-rep`、`_ncu.log`、`_metrics.csv`，以及汇总的 `_samples.csv`、`_average.csv`。
+
+当前命令行参数顺序为：
+
+```text
+day04_coalescing.exe mode stride row col block
+```
+
+| mode | 当前实际调用 |
+| ---: | :--- |
+| 0 | `normal_copy`；本章使用 stride=1 |
+| 1 | `stride_write`；未纳入本章主对比 |
+| 2 | `transpose_matrix` |
+| 3 | `transpose_matrix_tiling`，block 固定 32×32 |
+| 4 | `transpose_matrix_tiling_32x8__without_condition`，block 固定 32×8 |
+
+**当前 mode 4 和脚本的 kernel filter 均指向无判断版。** 要复现 A 的带判断循环版，需要将 main 中调用和脚本的 kernel filter 一起切回 `transpose_matrix_tiling_32x8`，再构建。文件名前缀仍叫 `transpose_tiling_loop`，识别历史版本应同时查看时间戳目录与 CSV 的 `Kernel` 字段。
+
+要重做 BLOCK_ROWS 扫描，需要同时修改 main 的 `blockDim.y` 和内核循环步长，最后一个命令行参数 `block` 不会改变 tiled 的启动尺寸。
+
+例如读取 B 的第 7 次异常报告：
+
+```powershell
+ncu --import .\labs\day04_coalescing\result\20261014_210917_288\transpose_tiling_loop_4096_4096_b32x8_run07.ncu-rep --page details
+```
+
+完整终端摘录保存在 [性能指标汇总.md](docs/性能指标汇总.md)。原始 CSV 比终端格式化表更适合核对单位、精度、逐次结果和 kernel 名称。
+
+## 10. 本章得到的分析方法
+
+1. **从源码预测访问模式，再用计数验证。** 本实验的关键证据是读 sectors/request 从 32 降到 4。
+2. **明确指标所在层级。** L1TEX sector、缓存命中和 DRAM 字节各自描述不同环节。
+3. **优化后重新定位瓶颈。** 改善合并访问后，线程组织成为新的关注点；循环版进一步接近 DRAM 吞吐限制。
+4. **按相同工作量比较指令。** 每 warp 指令增加，仍可能因 warp 数减少而降低总指令工作。
+5. **区分计数、比率与时间。** Occupancy、eligible、issue active、stall ratio 都不能单独作为优化目标。
+6. **减少指令不保证加速。** 关键在于是否减少决定任务完成时间的工作，而不是仅看指令总数。
+7. **均值要配合逐次样本。** 异常可拉高均值；原始结果、中位数、波动和批次信息应一起保留。
+
+本章保留带判断的 32×8 循环版作为主要学习基线，记录无判断实验为“指令明显减少，但未观察到明确收益”。向量化、异步 global→shared 搬运和流水线留作后续专题，不作为本章完成的前提。
+
+## 参考资料
+
+- [NVIDIA：An Efficient Matrix Transpose in CUDA C/C++](https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/)，用于对照 tiled、线程循环和 padding 的设计。
+- [NVIDIA：Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/)，用于核对指标口径、缓存控制和采集条件。

@@ -141,7 +141,8 @@ int main(int argc, char** argv)
 
         CudaTimer timer;
         float ms = timer.benchmark([&]() {
-            transpose_matrix_tiling_32x8<<<grid, block_32x8>>>(d_in.get(), d_out.get(), row, col);
+            //transpose_matrix_tiling_32x8<<<grid, block_32x8>>>(d_in.get(), d_out.get(), row, col);
+            transpose_matrix_tiling_32x8__without_condition<<<grid, block_32x8>>>(d_in.get(), d_out.get(), row, col);
         });
 
         double bytes_rw = 2.0 * static_cast<double>(row) * col * sizeof(float);
