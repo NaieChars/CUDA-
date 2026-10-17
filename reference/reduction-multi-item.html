@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>多元素归约速查</title><link rel="stylesheet" href="../assets/teaching.css"></head><body><main>
+<header><div class="eyebrow">CUDA LABS · REFERENCE</div><h1>多元素归约速查</h1><a href="../lessons/0001-multi-item-reduction.html">返回练习</a></header>
+<h2>符号与约定</h2><div class="table-wrap"><table><tr><th>符号</th><th>含义</th></tr><tr><td>B</td><td>blockDim.x；本项目为 [32,1024] 内 2 的幂</td></tr><tr><td>I</td><td>items_per_thread；本项目为 [1,64]</td></tr><tr><td>局部和</td><td>一个线程私有 sum 中的累加结果</td></tr><tr><td>部分和</td><td>一个 block 输出到 partial[b] 的结果</td></tr><tr><td>一轮 / pass</td><td>一次 kernel 启动，将输入归约成各 block 的部分和</td></tr></table></div>
+<h2>三条索引关系</h2><pre>base = size_t(blockIdx.x) * B * I
+idx  = base + tid + size_t(j) * B
+下一轮长度 = n / (B*I) + (n % (B*I) != 0)</pre><p>同一 j 时相邻 tid 访问相邻元素。每个有效输入恰好被一个线程读取；尾部不读取越界位置，线程局部和从 0 开始。shared memory 仍只需 B 个 float。</p>
+<h2 id="implementation">参考实现：先自己完成再展开</h2><details><summary>查看 reduce_multi_item</summary><pre><code>__global__ void reduce_multi_item(const float* in, float* partial,
+                                  size_t n, int items_per_thread)
+{
+    extern __shared__ float s[];
+    const unsigned int tid = threadIdx.x;
+    const size_t base = static_cast&lt;size_t&gt;(blockIdx.x)
+                      * blockDim.x * items_per_thread;
+
+    float sum = 0.0f;
+    for (int j = 0; j &lt; items_per_thread; ++j)
+    {
+        const size_t idx = base + tid
+                         + static_cast&lt;size_t&gt;(j) * blockDim.x;
+        if (idx &lt; n)
+            sum += in[idx];
+    }
+
+    s[tid] = sum;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x &gt;&gt; 1;
+         stride &gt; 0; stride &gt;&gt;= 1)
+    {
+        if (tid &lt; stride)
+            s[tid] += s[tid + stride];
+        if (stride &gt; 1)
+            __syncthreads();
+    }
+
+    if (tid == 0)
+        partial[blockIdx.x] = s[0];
+}</code></pre><p>保留了用户基础版最后一轮省略屏障的方式。stride=1 时仅线程 0 更新并读取 s[0]，不存在等待其他线程写入的需求。其他轮次仍由全部线程执行屏障。</p></details>
+<h2>测量前的预测</h2><p>第一轮完整 block 数约减为原来的 1/I；每个 block 的树深度不变，原始输入总量不变，不能据此预测 I 倍提速。I 不是越大越好；每线程串行工作增加和 grid 缩小都可能影响性能。I=1 可作为与基础版对照的配置，但两个不同 kernel 的编译结果和耗时不保证完全一致。</p>
+<h2>原始资料</h2><p><a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf#page=18">NVIDIA 归约教程：First Add During Load</a> · <a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf#page=31">Algorithm Cascading</a> · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">合并访存</a> · <a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#synchronization-functions">同步</a></p><footer>这份实现对应当前项目的连续 chunk 分工，没有引入 grid-stride loop 或 warp shuffle。实现或结果有疑问时，把相关代码发给聊天中的老师。</footer>
+</main></body></html>

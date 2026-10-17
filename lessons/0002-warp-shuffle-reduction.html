@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Warp shuffle 归约 · CUDA 练习 02</title><link rel="stylesheet" href="../assets/teaching.css"><script defer src="../assets/retrieval.js"></script><script defer src="../assets/warp-reduction.js"></script></head><body><main>
+<header><div class="eyebrow">CUDA LABS · 练习 02 · MODE 2</div><h1>把通信放进 warp 内</h1><p class="lede">沿用上一版的多元素加载，学习一次 32 线程求和，再把它组合成 block 求和。课件分三步：warp → 两级汇总 → 补全代码。</p><a href="0001-multi-item-reduction.html">上一课</a> · <a href="../reference/reduction-warp-shuffle.html">本节速查与参考实现</a></header>
+<section id="recall"><h2>先从上一版接过来</h2><p>不看源码回忆：线程 tid 第 j 次读取的位置是什么？你的多元素版已经完成，本节保留这一加载循环及其边界处理。输入分工和每线程元素数都不改变，只替换求和通信方式。</p><details><summary>核对加载公式</summary><pre>base = size_t(blockIdx.x) * blockDim.x * items_per_thread
+idx = base + tid + size_t(j) * blockDim.x</pre></details></section>
+<section id="warp"><h2>一步：32 个线程怎样交换值？</h2><p>本项目的一维 block 每连续 32 个线程组成一个 warp；warp 内位置叫 lane，范围为 0～31。<code>lane = tid % 32</code>，<code>warp_id = tid / 32</code>。</p><pre>float other = __shfl_down_sync(0xffffffffu, sum, offset);</pre><p>这条指令取得同一 warp 中 lane+offset 的 sum，通过寄存器通信，无需先写 shared memory。它只返回对方的值，加法仍由 <code>sum += other</code> 完成。若 lane+offset 超出默认宽度 32，则返回当前线程自己的值；因此最终只使用 lane 0 的完整和，不把其他 lane 的返回值都当作总和。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#warp-shuffle-functions">官方语义</a>。</p>
+<pre><code>__device__ __forceinline__ float warp_sum(float value)
+{
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return value;  // 完整总和位于 lane 0
+}</code></pre><p>把 helper 定义在 kernels.cu 的核函数之外、reduce_shuffle 之前。<code>__device__</code> 表示 GPU 调用，<code>__forceinline__</code> 是编译器内联指示。本节推荐先读 NVIDIA <a href="https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/">Using CUDA Warp-Level Primitives 的 Listing 1</a>。</p>
+<div class="exercise" data-warp-reduction><h3>跟踪 1～32 的求和</h3><p>每次前进一步完成一个 offset。只展示仍通向 lane 0 总和的有效前缀；点号表示该位置不再用于后续结果，不代表线程退出或不执行 shuffle。</p><div class="lane-grid" data-lanes></div><p role="status" aria-live="polite" class="feedback"></p><button type="button" data-previous>上一步</button> <button type="button" data-next>下一步</button></div>
+<form class="exercise" data-retrieval data-correct="正确：77=2×32+13。lane 编号在每个 warp 中重新从 0 开始。" data-retry="先做整数除法和取余：warp_id=77/32，lane=77%32。"><p><strong>练习 1：</strong>线程 tid=77 属于哪个 warp、哪个 lane？</p><label>warp_id <input type="number" required data-answer="2"></label><label>lane <input type="number" required data-answer="13"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="mask"><h2>full mask 表示哪些线程参加</h2><p><code>0xffffffffu</code> 的 32 个二进制位均为 1，表示 warp 的 32 个 lane 都参加。它不是“32 个输入有效”的标志。本节保持每个 warp 的 32 个线程都执行 helper；没有有效输入的线程提供 0。block 是 [32,1024] 内的 2 的幂，因而不存在物理上不足 32 个线程的最后一个 warp。</p><p>不要把 helper 放进 <code>if (idx &lt; n)</code>、<code>if (lane &lt; offset)</code> 或 <code>if (lane &lt; num_warps)</code>，也不要提前 return。被 mask 指定的线程必须执行相应 shuffle，来源 lane 也必须参与。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#warp-shuffle-functions">参与规则</a>。</p></section>
+<section id="block"><h2>两步：跨 warp 仍然用 shared memory 接力</h2><p>B=256 时有 8 个 warp，每个 warp 各自得到一个总和，shuffle 无法直接跨 warp 读取。解决方法：</p><pre>256 个线程局部和
+  ↓ 各 warp 全部 32 个 lane 执行 warp_sum
+8 个 warp 和，分别位于各自的 lane 0
+  ↓ 各 lane 0 写 warp_sums[warp_id]
+所有 block 线程执行一次 __syncthreads()
+  ↓ warp 0 的 lane 0～7 读取 8 个和，其余 24 个 lane 提供 0
+warp 0 全部 32 个 lane 再执行 warp_sum
+  ↓
+线程 0 写 partial[blockIdx.x]</pre><p>第二次调用可以放在 <code>if (warp_id == 0)</code> 中，因为它选中完整的一个 warp；不能只让其中 8 个线程调用。shuffle 的 sync 不提供 shared memory 的内存屏障，所以两级间的一次 block 屏障必须保留。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#warp-shuffle-functions">内存顺序说明</a>。</p>
+<form class="exercise" data-retrieval data-correct="正确。8 个 warp 和进入 warp 0，剩余 24 个 lane 用 0 填充，但仍全部参与 shuffle。" data-retry="num_warps=B/32；warp 0 总共 32 个 lane，补零数为 32-num_warps。"><p><strong>练习 2：</strong>B=256 时共有多少个 warp？第二级 warp 0 有多少个 lane 应提供 0？</p><label>warp 数 <input type="number" required data-answer="8"></label><label>补零数 <input type="number" required data-answer="24"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="code"><h2>三步：补完 reduce_shuffle</h2><p>复制你多元素版的加载与局部累加代码，得到每线程的 sum。删除原 shared memory 求和树，替换成下面的汇总。先尝试填空，再查看速查中的折叠答案。</p><pre><code>extern __shared__ float warp_sums[];
+const unsigned int lane = /* TODO A */;
+const unsigned int warp_id = /* TODO B */;
+const unsigned int num_warps = blockDim.x / 32;
+
+// 前面已完成每线程 sum 的加载和累加。
+sum = warp_sum(sum);
+
+if (/* TODO C：每个 warp 谁写出 */)
+    warp_sums[warp_id] = sum;
+
+__syncthreads();  // 所有 block 线程执行，不能放在上面的 if 内。
+
+if (warp_id == 0)
+{
+    float block_sum = /* TODO D：有效 warp 和，否则 0 */;
+    block_sum = warp_sum(block_sum); // warp 0 的全部 32 个 lane 调用
+    if (lane == 0)
+        partial[blockIdx.x] = block_sum;
+}</code></pre><p>完成后启用 <code>kShuffleImplemented</code>。现有 launcher 分配 B 个 float，足以存放 B/32 个 warp 和；本节保留启动参数，避免同时引入资源配置变化。</p><p><a href="../reference/reduction-warp-shuffle.html#implementation">完成后核对参考实现</a>。特别检查 B=32 时只读取一个 warp 和，B=1024 时恰好读取 32 个，以及 n=1 时其余线程仍参与调用。</p></section>
+<section id="expect"><h2>只记录预测，测量集中做</h2><p>与相同 B、I 的多元素版相比，输入访问和部分和数量相同；每个 warp 只写一个 shared 槽位，再由 warp 0 读取。B=256 时，你当前基础树在加载后和 stride=128～2 后共执行 8 次 block 屏障，这份两级方案执行 1 次。</p><p>源码使用的 shared 槽位变少，但 launcher 仍预留 B×sizeof(float) 字节，不能据此声称占用下降或 occupancy 提升。减少屏障也不能直接推导加速比例。按你的安排，所有版本完成后统一做正确性检查、完整计时和 profiler 分析；本节没有性能结果。</p></section>
+<footer>完成标准：能解释 lane、full mask、两级汇总和那一次 block 屏障，并独立补全代码。<a href="0001-multi-item-reduction.html">复习上一课</a> · <a href="../reference/reduction-warp-shuffle.html">本节速查</a>。不清楚时，把具体代码、推导或测试答案发给聊天中的老师。</footer>
+</main></body></html>

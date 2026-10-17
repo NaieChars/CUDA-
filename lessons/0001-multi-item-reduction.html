@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>多元素归约 · CUDA 练习 01</title><link rel="stylesheet" href="../assets/teaching.css"><script defer src="../assets/retrieval.js"></script></head>
+<body><main>
+<header><div class="eyebrow">CUDA LABS · 练习 01 · MODE 1</div><h1>先在每个线程内求和</h1><p class="lede">约 10 分钟。沿用你已写好的 block 内求和树，只改变输入阶段。目标：独立写出保留合并访存的多元素索引。</p><a href="../MISSION.md">学习目标</a> · <a href="../reference/reduction-multi-item.html">本节速查与参考实现</a></header>
+<section id="recall"><h2>先回忆一个依赖</h2><p>基础版中，加载到 shared memory 后为什么要同步？先用一句话回答，再展开。</p><details><summary>核对解释</summary><p>后续线程要读取其他线程写入的 s 槽位，必须先保证加载完成并可见。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#synchronization-functions">同步依据</a>。</p></details></section>
+<section id="model"><h2>把 B × I 个输入，先压成 B 个局部和</h2><p>记 B = blockDim.x，I = items_per_thread。基础版每个 block 处理 B 个数；本版处理 B × I 个数。每个线程用一个私有 <code>float sum</code> 累加 I 个输入，再执行 <code>s[tid] = sum</code>。后半段仍是原来的 B 元素求和树。</p><pre>全局输入 B × I 个数
+        ↓ 每个线程独立累加 I 个数
+      B 个线程局部和
+        ↓ 写入 shared memory，再同步
+      原来的 block 内求和树
+        ↓
+      1 个 block 部分和</pre><p>这个组合对应 NVIDIA 教程中的 <a href="https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf#page=31">Algorithm Cascading（幻灯片 31）</a>。局部 sum 通常可由编译器放在寄存器中，实际分配由编译结果决定。</p></section>
+<section id="index"><h2>让同一轮的相邻线程读取相邻地址</h2><p>block b 的起点是 <code>base = size_t(b) * B * I</code>。线程 tid 第 j 次读取：</p><pre>idx = base + tid + size_t(j) * B</pre><p>用 B=4、I=3、base=0 看分工（4 个线程仅用于示意，项目实际 B 至少为 32）：</p><div class="table-wrap"><table><thead><tr><th>循环轮次</th><th>线程 0</th><th>线程 1</th><th>线程 2</th><th>线程 3</th></tr></thead><tbody><tr><td>j = 0</td><td>in[0]</td><td>in[1]</td><td>in[2]</td><td>in[3]</td></tr><tr><td>j = 1</td><td>in[4]</td><td>in[5]</td><td>in[6]</td><td>in[7]</td></tr><tr><td>j = 2</td><td>in[8]</td><td>in[9]</td><td>in[10]</td><td>in[11]</td></tr></tbody></table></div><p>横着看：同一轮不同线程的地址连续。竖着看：单个线程的多次读取相隔 B。判断合并访存，要看同一 warp 执行同一条加载指令时的地址，参见 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">NVIDIA Best Practices §10.2.1</a>。</p>
+<form class="exercise" data-retrieval data-correct="正确。线程 3 读取 24+3+0×8 和 24+3+2×8。" data-retry="再算一次：base=b×B×I，idx=base+tid+j×B；别把 I 当作循环中的地址步长。"><p><strong>练习 1：</strong>B=8、I=3、b=1，线程 3 在 j=0 和 j=2 分别读哪个下标？</p><label>j=0 <input type="number" required data-answer="27" aria-label="j 等于 0 时的下标"></label><label>j=2 <input type="number" required data-answer="43" aria-label="j 等于 2 时的下标"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="code"><h2>现在写进 reduce_multi_item</h2><p>在 <code>labs/reduction/src/kernels.cu</code> 中补齐下面两行，再接上你已有的 shared memory 归约循环和线程 0 写出结果的代码。</p><pre><code>extern __shared__ float s[];
+const unsigned int tid = threadIdx.x;
+const size_t base = /* TODO：这个 block 的输入起点 */;
+
+float sum = 0.0f;
+for (int j = 0; j &lt; items_per_thread; ++j)
+{
+    const size_t idx = /* TODO：线程 tid 第 j 次读取的位置 */;
+    if (idx &lt; n)
+        sum += in[idx];
+}
+
+s[tid] = sum;
+__syncthreads();
+
+// 接上你基础版的步长减半循环。
+// 最后由线程 0 写 partial[blockIdx.x]。</code></pre><p>加载循环中无需屏障：线程只更新自己的 sum。循环结束后，每个线程无论是否读到有效数据，都写入一个已初始化的局部和并执行屏障。尾部逐次检查 idx，不能因本轮越界就遗漏后续的 shared memory 写入与同步。</p>
+<form class="exercise" data-retrieval data-correct="正确：线程 0 只有第一个位置有效；线程 235 从第一个位置就越界，仍写出 sum=0 并参与同步。" data-retry="block 1 的 base 是 256×2=512。分别计算 base+tid 和 base+tid+256，再与 n=747 比较。"><p><strong>练习 2：</strong>n=747、B=256、I=2。block 1 中，线程 0 和线程 235 各读取几个有效输入？</p><label>线程 0 <input type="number" required data-answer="1" aria-label="线程 0 的有效输入数量"></label><label>线程 235 <input type="number" required data-answer="0" aria-label="线程 235 的有效输入数量"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form><p><a href="../reference/reduction-multi-item.html#implementation">写完后核对完整参考实现</a>。仅完成后启用 <code>kMultiItemImplemented = true</code>。</p></section>
+<section id="measure"><h2>先预测，再验证</h2><p>对于 n=16,777,216、B=256，第一轮 I=1 产生 65,536 个部分和；I=4 产生 16,384 个。每个 block 的求和树仍有 8 层，原始输入仍全部读取一次。变化来自更少的 block 内归约与中间部分和，而不是少读了四分之三的原始数组。这是由本项目分工推导的预测，不是性能测量结果。</p><p class="note">I=4 的完整计划为 16,777,216 → 16,384 → 16 → 1，仍然是 3 轮 kernel。更少的部分和不保证更少的 kernel 启动。</p><p>I 增大也会拉长每个线程的串行工作，并减少可调度的 block。速度是否提升、提升多少，要实际测量。</p><pre><code>cmake --build build --config Release --target reduction --parallel
+
+# 先检查 block 容量左右的尾部，I=3 也要覆盖。
+.&#92;labs&#92;reduction&#92;scripts&#92;run_benchmark.ps1 -Modes 1 -Sizes 1,31,32,33,255,256,257,767,768,769,1003,1023,1024,1025 -Blocks 256 -ItemsPerThread 1,3,4 -CheckOnly -Repeat 1
+
+# 再控制 block 和 n，只扫描每线程元素数。
+.&#92;labs&#92;reduction&#92;scripts&#92;run_benchmark.ps1 -Modes 1 -ItemsPerThread 1,2,4,8 -Repeat 3</code></pre><p>计时脚本测完整归约；ncu 脚本测首轮，两者不要直接混作同一个时间。改变累加分组可能改变浮点误差，校验使用框架已有容差，参见 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#floating-point-math-is-not-associative">浮点加法的非结合性</a>。</p></section>
+<footer>完成标准：能解释两行索引、独立补完 mode 1、通过尾部校验。下次先凭记忆写出 idx，再学 warp shuffle。任何一步不清楚，都可以把代码或你的推导发给聊天中的老师继续讨论。<br><a href="0002-warp-shuffle-reduction.html">下一课：warp shuffle 归约</a> · <a href="../reference/reduction-multi-item.html">速查</a> · <a href="../RESOURCES.md">来源与阅读范围</a></footer>
+</main></body></html>

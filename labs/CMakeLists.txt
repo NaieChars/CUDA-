@@ -1,1 +1,2 @@
 add_subdirectory(day04_coalescing)
+add_subdirectory(reduction)

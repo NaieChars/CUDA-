@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Warp shuffle 归约速查</title><link rel="stylesheet" href="../assets/teaching.css"></head><body><main>
+<header><div class="eyebrow">CUDA LABS · REFERENCE</div><h1>Warp shuffle 归约速查</h1><a href="../lessons/0002-warp-shuffle-reduction.html">返回练习 02</a> · <a href="reduction-multi-item.html">多元素版速查</a></header>
+<h2>术语和调用条件</h2><div class="table-wrap"><table><tr><th>项</th><th>本节含义</th></tr><tr><td>lane</td><td>warp 内位置：tid % 32</td></tr><tr><td>warp_id</td><td>block 内 warp 编号：tid / 32</td></tr><tr><td>full mask</td><td>本 warp 全部 32 个 lane 参加调用</td></tr><tr><td>warp 和</td><td>仅 lane 0 的 helper 返回值用作该 warp 的总和</td></tr><tr><td>block 和</td><td>warp 0 再合并各 warp 和，线程 0 写出</td></tr></table></div>
+<p>前提：本项目一维 block 为 [32,1024] 中 2 的幂，全部线程保留至两级之间的 block 屏障。无有效输入的线程提供 0，第二级不足 32 个 warp 和时补零。shuffle 不跨 warp，也不提供 shared memory 的内存屏障。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#warp-shuffle-functions">官方语义</a>。</p>
+<h2 id="implementation">先完成练习，再核对</h2><details><summary>查看 helper 和完整参考实现</summary><pre><code>// 放在 kernels.cu 中，reduce_shuffle 定义之前。
+__device__ __forceinline__ float warp_sum(float value)
+{
+    for (int offset = 16; offset &gt; 0; offset &gt;&gt;= 1)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return value; // 仅 lane 0 用作总和
+}
+
+__global__ void reduce_shuffle(const float* in, float* partial,
+                               size_t n, int items_per_thread)
+{
+    extern __shared__ float warp_sums[];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid % 32;
+    const unsigned int warp_id = tid / 32;
+    const unsigned int num_warps = blockDim.x / 32;
+    const size_t base = static_cast&lt;size_t&gt;(blockIdx.x)
+                      * blockDim.x * items_per_thread;
+
+    float sum = 0.0f;
+    for (int j = 0; j &lt; items_per_thread; ++j)
+    {
+        const size_t idx = base + tid
+                         + static_cast&lt;size_t&gt;(j) * blockDim.x;
+        if (idx &lt; n)
+            sum += in[idx];
+    }
+
+    sum = warp_sum(sum);
+    if (lane == 0)
+        warp_sums[warp_id] = sum;
+
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        float block_sum = (lane &lt; num_warps)
+                        ? warp_sums[lane] : 0.0f;
+        block_sum = warp_sum(block_sum);
+        if (lane == 0)
+            partial[blockIdx.x] = block_sum;
+    }
+}</code></pre><p>设置 kShuffleImplemented=true 之后才能从框架启动。当前 launcher 的 block*sizeof(float) 动态 shared memory 足够使用，暂不改变分配策略。</p></details>
+<h2>三处容易错的地方</h2><p>第一，不能把 block 屏障放进 lane==0 的分支；第二，warp 0 的补零 lane 也必须执行第二次 full-mask helper；第三，尾部输入不完整不等于 warp 线程不存在，不因输入无效而提前退出。</p>
+<h2>推导与后续测量</h2><p>每个 block 使用 B/32 个 shared 槽位、一次 block 屏障；实际预分配仍是 B 个 float。与 mode 1 固定 B、I 比较时，原始输入读取量和输出部分和数量相同。先记录这些可检查的结构变化，所有版本完成后再测试正确性和实际性能。</p>
+<p>推荐阅读：<a href="https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/">NVIDIA Using CUDA Warp-Level Primitives，Listing 1</a>。后续若改变 block 大小约束、参与线程集合或 helper 调用分支，须重新分析 mask，不能直接套用本节前提。</p><footer>代码或同步推导有疑问时，把具体位置发给聊天中的老师。<a href="../lessons/0002-warp-shuffle-reduction.html">回到练习</a></footer>
+</main></body></html>
