@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Register-tiled SGEMM 速查</title><link rel="stylesheet" href="../assets/teaching.css"></head><body><main>
+<header><div class="eyebrow">CUDA LABS · REFERENCE</div><h1>Register GEMM：线程内的二维复用</h1><a href="../lessons/0005-register-gemm.html">返回练习 05</a> · <a href="sgemm-shared.html">Shared 版速查</a></header>
+<h2>固定配置与三个独立分工</h2><p>BX=BY=16，BM=BN=32，BK=16，TM=TN=2。256 个线程覆盖 1024 个输出；动态 shared 为 (BM×BK+BK×BN)×4=4096 字节。以下是本课选择的一种合法分工，配套加载、累加与写回必须一致。</p>
+<div class="table-wrap"><table><tr><th>用途</th><th>规则</th></tr>
+<tr><td>输出归属</td><td>r_i=ty+i×BY，c_j=tx+j×BX；C[by×BM+r_i,bx×BN+c_j]</td></tr>
+<tr><td>shared 加载归属</td><td>tid=ty×BX+tx，q=tid+s×(BX×BY)，A/B 各自遍历</td></tr>
+<tr><td>A 槽位 q</td><td>tile 行=q/BK，K 列=q%BK；global 行宽 K</td></tr>
+<tr><td>B 槽位 q</td><td>K 行=q/BN，tile 列=q%BN；global 行宽 N</td></tr>
+<tr><td>一个 e 的私有片段</td><td>a_frag[i]=As[r_i,e]；b_frag[j]=Bs[e,c_j]</td></tr>
+<tr><td>一个 e 的外积</td><td>acc[i][j]+=a_frag[i]×b_frag[j]</td></tr></table></div>
+<p>acc[2][2] 是逻辑分组，所对应的输出行列在本例中间隔 16。输入越界补零；每段先发布 shared，再计算，读完后才能覆盖；四个输出各自判断合法性。线程自己的寄存器片段不需要额外同步。</p>
+<h2 id="implementation">独立完成后展开核对</h2><details><summary>查看 sgemm_register 参考实现</summary><pre><code>__global__ void sgemm_register(const float* __restrict__ a,
+                               const float* __restrict__ b,
+                               float* __restrict__ c,
+                               size_t m, size_t n, size_t k)
+{
+    constexpr int BX = sgemm_config::kBlockX;
+    constexpr int BY = sgemm_config::kBlockY;
+    constexpr int BM = sgemm_config::kRegisterTileM;
+    constexpr int BN = sgemm_config::kRegisterTileN;
+    constexpr int BK = sgemm_config::kRegisterTileK;
+    constexpr int TM = sgemm_config::kThreadTileM;
+    constexpr int TN = sgemm_config::kThreadTileN;
+    constexpr int NT = BX * BY;
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    const int tid = ty * BX + tx;
+    const size_t block_row = static_cast&lt;size_t&gt;(blockIdx.y) * BM;
+    const size_t block_col = static_cast&lt;size_t&gt;(blockIdx.x) * BN;
+
+    extern __shared__ float smem[];
+    float* as = smem;
+    float* bs = smem + BM * BK;
+    float acc[TM][TN] = {};
+
+    for (size_t k0 = 0; k0 &lt; k; k0 += BK)
+    {
+        for (int q = tid; q &lt; BM * BK; q += NT)
+        {
+            const size_t row = block_row + q / BK;
+            const size_t p = k0 + q % BK;
+            as[q] = (row &lt; m &amp;&amp; p &lt; k)
+                ? a[row * k + p] : 0.0f;
+        }
+        for (int q = tid; q &lt; BK * BN; q += NT)
+        {
+            const size_t p = k0 + q / BN;
+            const size_t col = block_col + q % BN;
+            bs[q] = (p &lt; k &amp;&amp; col &lt; n)
+                ? b[p * n + col] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int e = 0; e &lt; BK; ++e)
+        {
+            float a_frag[TM], b_frag[TN];
+            #pragma unroll
+            for (int i = 0; i &lt; TM; ++i)
+                a_frag[i] = as[(ty + i * BY) * BK + e];
+            #pragma unroll
+            for (int j = 0; j &lt; TN; ++j)
+                b_frag[j] = bs[e * BN + tx + j * BX];
+
+            #pragma unroll
+            for (int i = 0; i &lt; TM; ++i)
+            {
+                #pragma unroll
+                for (int j = 0; j &lt; TN; ++j)
+                    acc[i][j] += a_frag[i] * b_frag[j];
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i &lt; TM; ++i)
+    {
+        const size_t row = block_row + ty + i * BY;
+        #pragma unroll
+        for (int j = 0; j &lt; TN; ++j)
+        {
+            const size_t col = block_col + tx + j * BX;
+            if (row &lt; m &amp;&amp; col &lt; n)
+                c[row * n + col] = acc[i][j];
+        }
+    }
+}</code></pre><p>核函数仍由你手写；完成后才启用 kRegisterImplemented。#pragma unroll 表达展开意图，不构成物理寄存器分配或无溢出的证据。</p></details>
+<h2>四个容易混淆的地方</h2><p>block 输出起点乘 BM/BN，不是 blockDim。As 的行宽 BK，Bs 的行宽 BN。每个 shared tile 有 512 个值而线程只有 256 个，必须加载第二轮 q。输出为分散的四个坐标，写回不能复用首个输出的边界条件。</p>
+<h2>准备验证的假设</h2><p>每个 e 内，一线程读取 TM+TN=4 个 shared 标量，完成 TM×TN=4 次乘加；四个独立输出线程按上一版写法需要合计 8 次读取。这个源码层面的 shared 读取计数减少一半，不保证 profiler 请求或服务周期减半。四个累加器提供独立依赖链，但实际调度收益仍待测。</p>
+<p>本版还把 block 输出从 16×16 扩到 32×32。对同一 32×32 输出、完整 BK=16，前版四个 block 共加载 2048 个 global 输入标量，本版一个 block 加载 1024 个。这个收益来自更大的输出 tile；三版成绩不能隔离纯粹的线程内寄存器复用效果。代价与待查项包括寄存器数量、local/spill、shared 占用和问题总 block 数。</p>
+<p>依据：<a href="https://docs.nvidia.com/cutlass/4.5.2/media/docs/cpp/efficient_gemm.html#thread-level-gemm">CUTLASS：Thread-level GEMM 与外积</a> · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#local-memory">局部数组与 local memory</a> · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#register-pressure">寄存器压力</a>。具体线程映射、补零和计数为按本项目配置推导的教学实现，不是 CUTLASS 实现的直接移植。</p>
+<footer><a href="../lessons/0005-register-gemm.html">返回课件与正确性验证命令</a>。代码完成后可在聊天中提交索引解释或实现，三版验证后再统一测性能。</footer>
+</main></body></html>

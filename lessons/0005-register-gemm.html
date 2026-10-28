@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Register Tiling · CUDA 练习 05</title><link rel="stylesheet" href="../assets/teaching.css"><script defer src="../assets/retrieval.js"></script><script defer src="../assets/gemm-outer-product.js"></script></head><body><main>
+<header><div class="eyebrow">CUDA LABS · 练习 05 · SGEMM MODE 2</div><h1>四个累加器，一组外积</h1><p class="lede">约 15～20 分钟。目标：每个线程负责 2×2 个输出，用两份 A 操作数和两份 B 操作数完成四次乘加，写出支持尾部的 register-tiled GEMM。</p><a href="0004-shared-gemm.html">上一课：shared tiling</a> · <a href="../reference/sgemm-register.html">速查与折叠答案</a> · <a href="../labs/sgemm/README.md">实验接口</a></header>
+<section id="idea"><h2>sum 原本就可能在寄存器中，这次增加的是复用</h2><p>上一版每个线程在一个 e 上读 A/B 各一个值，更新一个 sum。假如同一线程现在负责两行、两列的四个输出，就能读 A 的两个值、B 的两个值，交叉组合成四次乘加：</p>
+<pre><code>acc[0][0] += a0 * b0;    acc[0][1] += a0 * b1;
+acc[1][0] += a1 * b0;    acc[1][1] += a1 * b1;</code></pre>
+<p>这叫一次 2×1 与 1×2 的<strong>外积</strong>。对每个 e 重复，再跨 K 段累加，最后得到四个完整点积。每个 A 操作数在本线程用两次，每个 B 也用两次；四个输出仍各有独立累加器，不做跨线程归约。<a href="https://docs.nvidia.com/cutlass/4.5.2/media/docs/cpp/efficient_gemm.html#thread-level-gemm">CUTLASS 的 Thread-level GEMM</a>用的就是在线程内组织寄存器复用和累加外积的思路；本课用普通 FP32 乘加实现。</p>
+<div class="exercise" data-gemm-outer-product data-a="[[1,2,3],[4,5,6]]" data-b="[[1,2],[3,4],[5,6]]">
+<h3>把四条点积，改看成三次外积</h3><p>选定的两条 A 行为 [1,2,3]、[4,5,6]，两条 B 列为 [1,3,5]、[2,4,6]。这里展示的是同一线程选中的行/列，它们在真实输出中可以相隔 16。</p>
+<div class="matrix-layout"><figure><figcaption>本步 A 操作数：2×1</figcaption><div data-fragment-a></div></figure><figure><figcaption>本步 B 操作数：1×2</figcaption><div data-fragment-b></div></figure><figure><figcaption>四个私有累加器</figcaption><div data-acc></div></figure></div>
+<p role="status" aria-live="polite" class="feedback"></p><button type="button" data-step>下一组</button> <button type="button" data-reset>重置</button>
+<noscript><p>三次外积依次为 [[1,2],[4,8]]、[[6,8],[15,20]]、[[15,18],[30,36]]；总和 [[22,28],[49,64]]。</p></noscript></div></section>
+<section id="ownership"><h2>256 个线程，覆盖 32×32 个输出</h2><p>框架保持 block=(16,16)，但 BM=BN=32、BK=16；每线程 TM=TN=2。256×4=1024，刚好覆盖一个 32×32 输出块。本课选用以下分工：</p>
+<pre>block_row = size_t(blockIdx.y) × BM
+block_col = size_t(blockIdx.x) × BN
+r_i = ty + i × 16，i=0,1        // block 内行号
+c_j = tx + j × 16，j=0,1        // block 内列号
+acc[i][j] → C[block_row+r_i, block_col+c_j]</pre>
+<p>因此 acc 是逻辑上的 2×2，四个输出在全局矩阵中并不相邻。例如线程 (tx=2,ty=3) 负责 block 内的 (3,2)、(3,18)、(19,2)、(19,18)。每个 block 内坐标 (r,c) 都能唯一反推 ty=r%16、i=r/16、tx=c%16、j=c/16，故没有遗漏或重写。</p>
+<p>这个分工让固定 i、j 时的连续 tx 对应连续输出列，保留每半 warp 的连续写出地址。当前 16×16 block 的 warp 仍跨两行，不据此承诺完整 warp 的 sector 数。也可以设计连续小块的线程分工，但加载、计算、写回必须使用同一套坐标；本课先固定一种。</p>
+<form class="exercise" data-retrieval data-correct="正确：局部行 3、19，局部列 2、18；acc[1][0] 对应 (19,2)。输出行列间距均为 16。" data-retry="分别代入 r_i=ty+i×16、c_j=tx+j×16。acc 的第一维选择行，第二维选择列。"><p><strong>练习 1：</strong>tx=2,ty=3，acc[1][0] 对应的 block 内行、列是多少？</p><label>行 <input type="number" required data-answer="19"></label><label>列 <input type="number" required data-answer="2"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="loads"><h2>搬运分工独立于输出分工</h2><p>本段 As[BM,BK] 有 32×16=512 个元素，Bs[BK,BN] 有 16×32=512 个元素；共需 4096 字节动态 shared，框架已经预留。256 个线程平均各搬两个 A 和两个 B。不能沿用上一版“各搬一个”。</p>
+<p>先把 shared tile 展平成一维，让线程轮流覆盖槽位。tid=ty×16+tx，NT=256，对 A/B 分别执行 q=tid,tid+NT,…：</p>
+<div class="table-wrap"><table><thead><tr><th>目标</th><th>q 反推 tile 行/列</th><th>源 global 坐标</th></tr></thead><tbody>
+<tr><td>As[q]，q&lt;BM×BK</td><td>ar=q/BK，ap=q%BK</td><td>A[block_row+ar,k0+ap]</td></tr>
+<tr><td>Bs[q]，q&lt;BK×BN</td><td>bp=q/BN，bc=q%BN</td><td>B[k0+bp,block_col+bc]</td></tr>
+</tbody></table></div>
+<p>每个 q 只归一个 tid，故每段各槽位恰好写一次。越界写零，屏障规则延续上一课。A 的行宽是 BK=16，B 的行宽是 BN=32；加载 q 的坐标不是线程所负责的 C 坐标。</p>
+<form class="exercise" data-retrieval data-correct="正确：tid=50；q=306 时 As 坐标为 (19,2)，Bs 坐标为 (9,18)。两种 shared 数组的行宽不同。" data-retry="tid=3×16+2。q=tid+256，然后对 A 用除/余 16，对 B 用除/余 32。"><p><strong>练习 2：</strong>tx=2,ty=3，第二次搬运 q=tid+256。As 与 Bs 的 tile 行、列各是多少？</p><label>As 行 <input type="number" required data-answer="19"></label><label>As 列 <input type="number" required data-answer="2"></label><label>Bs 行 <input type="number" required data-answer="9"></label><label>Bs 列 <input type="number" required data-answer="18"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="inner"><h2>先读出两组操作数，再组合四个输出</h2><pre><code>// 第一屏障之后，每个 e：
+a_frag[i] = As[(ty + i * 16) * BK + e];   // i=0,1
+b_frag[j] = Bs[e * BN + tx + j * 16];     // j=0,1
+acc[i][j] += a_frag[i] * b_frag[j];       // 四种 i,j 组合</code></pre>
+<p>把读取与四次乘加分开写，清楚表达“读一次、用两次”。acc 在所有 K 段之外初始化为零；a_frag/b_frag 每个 e 更新一次。每段末尾仍保留第二道屏障，保护 shared 不被下一段提前覆盖；寄存器中的私有复用不需要新增屏障。</p>
+<p>使用编译期固定的小数组，并对 i/j 循环加 <code>#pragma unroll</code>，有利于编译器将元素作为独立标量处理。但源码里的局部数组不等于已经证明放进物理寄存器；动态索引、资源压力可能导致 local memory，需结合编译报告和后续 profiler 检查。<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#local-memory">官方 local memory 说明</a>。</p></section>
+<section id="practice"><h2>编码分成五步</h2>
+<ol><li>声明 BM/BN/BK、TM/TN、BX/BY 常量；计算 block 起点、tid，创建归零的 acc[TM][TN]。</li>
+<li>将动态 shared 拆成 As[BM×BK] 与 Bs[BK×BN]，B 起点是 <code>smem + BM*BK</code>。</li>
+<li>K 段循环内，用两组 q 循环加载并补零，然后执行第一道屏障。</li>
+<li>遍历 e，读取 a_frag/b_frag，外积更新 acc；本段结束执行第二道屏障。</li>
+<li>遍历 i/j，为每一个输出分别判断 row&lt;m 且 col&lt;n，再覆盖写 C。</li></ol>
+<pre><code>float acc[TM][TN] = {};
+for (size_t k0 = 0; k0 &lt; k; k0 += BK)
+{
+    for (int q = tid; q &lt; BM * BK; q += NT)
+        as[q] = /* TODO：A 源坐标、合法性、补零 */;
+    for (int q = tid; q &lt; BK * BN; q += NT)
+        bs[q] = /* TODO：B 源坐标、合法性、补零 */;
+    __syncthreads();
+
+    for (int e = 0; e &lt; BK; ++e)
+    {
+        float a_frag[TM], b_frag[TN];
+        /* TODO：加载 TM + TN 个 shared 操作数 */
+        /* TODO：更新 TM × TN 个累加器 */
+    }
+    __syncthreads();
+}
+/* TODO：逐个输出判断边界，写回 acc */</code></pre>
+<p>在 <code>labs/sgemm/src/kernels.cu</code> 中仅实现 sgemm_register，完成后启用 kRegisterImplemented。不要按第一个输出的合法性提前 return，也不要用一个条件包住四次写出：M/N 尾部可能只有其中部分输出有效。<a href="../reference/sgemm-register.html#implementation">完整参考折叠在速查页</a>。</p>
+<pre><code>cmake --build build --config Release --target sgemm --parallel 1
+.&#92;labs&#92;sgemm&#92;scripts&#92;run_benchmark.ps1 -Modes 0,1,2 -Shapes '1x1x1','3x5x7','16x16x16','17x19x23','31x33x29','32x32x32','33x35x17','65x67x33' -CheckOnly -Repeat 1 -SkipBuild</code></pre>
+<p>33×35×17 检查 32 边界两侧的输出及 K 尾部；65×67×33 同时覆盖多 block、三段 K 与尾部。通过数值校验后，先核对每个 shared 槽位的生产者和两道屏障；实际 GPU 竞争检测可在后续验证时补充。</p></section>
+<section id="hypotheses"><h2>先留下两个可检验的预测</h2>
+<div class="table-wrap"><table><thead><tr><th>比较口径</th><th>shared 版</th><th>本版</th></tr></thead><tbody>
+<tr><td>固定一个 e，4 次乘加的 shared 标量读取</td><td>4 个输出线程合计 8 次</td><td>1 个线程读取 4 次后复用</td></tr>
+<tr><td>固定 32×32 输出、BK=16，global 输入标量读取</td><td>4 个 16×16 block，共 2048 次</td><td>1 个 32×32 block，共 1024 次</td></tr>
+</tbody></table></div>
+<p>第一行来自线程内复用；第二行来自更大的 block 输出 tile。都是完整 tile 下的源码标量计数，不是 profiler 请求数或 DRAM 字节。本框架第三版同时改变了这两点，因此最终三版计时不能单独隔离“纯 register tiling”的收益。</p>
+<p>代价是更多私有状态、每线程更多工作、shared 从 2 KiB 变为 4 KiB，以及同一问题下更少的 block；四个独立累加链也为调度提供更多指令级并行机会。是否值得，要检查实测时间、寄存器/溢出与并行度。不能用“occupancy 更高”或“shared 读取减半”中的一项预判胜负。</p></section>
+<footer>完成标准：能解释四个输出的唯一归属、两个加载循环为何完整覆盖 shared，以及一次外积如何复用操作数。主阅读只需 <a href="https://docs.nvidia.com/cutlass/4.5.2/media/docs/cpp/efficient_gemm.html#thread-level-gemm">CUTLASS Efficient GEMM：Thread-level GEMM</a> 一段；不要求学习 CUTLASS API。三版实现并验证后，进入统一性能测量与因果分析。<br><a href="../reference/sgemm-register.html">速查</a> · <a href="../RESOURCES.md">资料</a>。可以把索引推导或代码片段发到聊天，尤其欢迎讨论“加载归属为何不必等于输出归属”。</footer>
+</main></body></html>

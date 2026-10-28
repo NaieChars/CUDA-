@@ -44,5 +44,5 @@ if (warp_id == 0)
         partial[blockIdx.x] = block_sum;
 }</code></pre><p>完成后启用 <code>kShuffleImplemented</code>。现有 launcher 分配 B 个 float，足以存放 B/32 个 warp 和；本节保留启动参数，避免同时引入资源配置变化。</p><p><a href="../reference/reduction-warp-shuffle.html#implementation">完成后核对参考实现</a>。特别检查 B=32 时只读取一个 warp 和，B=1024 时恰好读取 32 个，以及 n=1 时其余线程仍参与调用。</p></section>
 <section id="expect"><h2>只记录预测，测量集中做</h2><p>与相同 B、I 的多元素版相比，输入访问和部分和数量相同；每个 warp 只写一个 shared 槽位，再由 warp 0 读取。B=256 时，你当前基础树在加载后和 stride=128～2 后共执行 8 次 block 屏障，这份两级方案执行 1 次。</p><p>源码使用的 shared 槽位变少，但 launcher 仍预留 B×sizeof(float) 字节，不能据此声称占用下降或 occupancy 提升。减少屏障也不能直接推导加速比例。按你的安排，所有版本完成后统一做正确性检查、完整计时和 profiler 分析；本节没有性能结果。</p></section>
-<footer>完成标准：能解释 lane、full mask、两级汇总和那一次 block 屏障，并独立补全代码。<a href="0001-multi-item-reduction.html">复习上一课</a> · <a href="../reference/reduction-warp-shuffle.html">本节速查</a>。不清楚时，把具体代码、推导或测试答案发给聊天中的老师。</footer>
+<footer>完成标准：能解释 lane、full mask、两级汇总和那一次 block 屏障，并独立补全代码。<a href="0001-multi-item-reduction.html">复习上一课</a> · <a href="../reference/reduction-warp-shuffle.html">本节速查</a> · <a href="0003-naive-gemm.html">下一课：朴素 GEMM</a>。不清楚时，把具体代码、推导或测试答案发给聊天中的老师。</footer>
 </main></body></html>

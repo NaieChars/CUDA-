@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>朴素 GEMM · CUDA 练习 03</title><link rel="stylesheet" href="../assets/teaching.css"><script defer src="../assets/retrieval.js"></script><script defer src="../assets/gemm-dot-product.js"></script></head><body><main>
+<header><div class="eyebrow">CUDA LABS · 练习 03 · SGEMM MODE 0</div><h1>一个线程，算出一个 C 元素</h1><p class="lede">约 10 分钟。目标：独立写出支持矩形与尾部的 sgemm_naive，解释同一轮的 warp 访问模式，为下一课的数据复用建立基线。</p><a href="0002-warp-shuffle-reduction.html">上一课：warp 归约</a> · <a href="../reference/sgemm-naive.html">本节速查与折叠答案</a> · <a href="../labs/sgemm/README.md">实验框架</a></header>
+<section id="ownership"><h2>输出并行，K 方向在线程内累加</h2><p>本实验计算 <code>C[M,N] = A[M,K] × B[K,N]</code>。选定输出 (row,col) 后，把 A 的第 row 行和 B 的第 col 列相乘求和：</p><pre>C[row,col] = Σ A[row,p] × B[p,col]，p = 0…K−1</pre><p>每个线程拥有一个独立输出，用私有 float sum 遍历 K，再写一次 C。它复用了你在多元素归约中掌握的局部累加方式。不同 C 元素之间没有本版所需的通信，因此无需 shared memory、shuffle、原子加或 block 屏障。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#shared-memory">官方朴素矩阵乘法示例</a>采用相同的输出分工。</p>
+<div class="exercise" data-gemm-dot-product data-a="[[1,2,3],[4,5,6]]" data-b="[[1,0,2,1],[0,1,1,2],[2,1,0,1]]">
+<h3>跟踪一个线程的局部和</h3><div class="demo-controls"><label>输出 row <select data-row aria-label="输出 row"></select></label><label>输出 col <select data-col aria-label="输出 col"></select></label></div>
+<div class="matrix-layout"><figure><figcaption>A：2×3</figcaption><div data-matrix-a></div></figure><figure><figcaption>B：3×4</figcaption><div data-matrix-b></div></figure><figure><figcaption>C：2×4</figcaption><div data-matrix-c></div></figure></div>
+<p role="status" aria-live="polite" class="feedback"></p><button type="button" data-step>计算下一项</button> <button type="button" data-reset>从 sum=0 开始</button><p>高亮先标出目标行/列，随后标出本步的两个输入。C 的点号表示其他线程的输出不在当前演示范围，不表示它们应写 0。</p></div></section>
+<section id="indices"><h2>三个矩阵，各用自己的行宽</h2><p>行主序偏移为“行号 × 本矩阵列数 + 列号”。A 的行宽是 K，B 和 C 的行宽是 N，M 用于行范围判断。</p><div class="table-wrap"><table><thead><tr><th>逻辑元素</th><th>一维数组表达式</th><th>行宽</th></tr></thead><tbody><tr><td>A[row,p]</td><td><code>a[row * k + p]</code></td><td>K</td></tr><tr><td>B[p,col]</td><td><code>b[p * n + col]</code></td><td>N</td></tr><tr><td>C[row,col]</td><td><code>c[row * n + col]</code></td><td>N</td></tr></tbody></table></div><p>这里用 p 做循环变量，避免覆盖形状参数 k；索引采用 size_t，做 block 坐标乘法前就先转换类型。</p>
+<form class="exercise" data-retrieval data-correct="正确：A 是 2×4+1=9，B 是 1×5+3=8，C 是 2×5+3=13。M 不参与这些行宽乘法。" data-retry="逐个确定矩阵行宽：A 用 K=4，B/C 用 N=5；最后再加列坐标。"><p><strong>练习 1：</strong>M=3、N=5、K=4，计算 C[2,3] 时，p=1 的 A、B 输入及最终 C 输出下标各是多少？</p><label>A <input type="number" required data-answer="9"></label><label>B <input type="number" required data-answer="8"></label><label>C <input type="number" required data-answer="13"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="mapping"><h2>把线程映射到输出矩阵</h2><p>框架的 block 为 (16,16)，grid.x 沿 N、grid.y 沿 M。对应关系是：</p><pre>row = size_t(blockIdx.y) × blockDim.y + threadIdx.y
+col = size_t(blockIdx.x) × blockDim.x + threadIdx.x</pre><p>不使用整除假设；线程映射后，若 row≥M 或 col≥N，可以直接 return。本版没有后续协作屏障，因此这个提前退出成立。下一课引入 shared memory 后，要重新分析参与同步的线程集合。</p>
+<form class="exercise" data-retrieval data-correct="正确：row=0×16+2=2，col=1×16+3=19，输出偏移为 2×23+19=65。K=7 决定该线程循环 7 次。" data-retry="blockIdx.y 计算 row，blockIdx.x 计算 col；输出偏移用 N=23 作行宽。"><p><strong>练习 2：</strong>M=19、N=23、K=7，blockIdx=(1,0)、threadIdx=(3,2)，该线程的 row、col 和 C 下标是多少？</p><label>row <input type="number" required data-answer="2"></label><label>col <input type="number" required data-answer="19"></label><label>C 下标 <input type="number" required data-answer="65"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="code"><h2>现在自己补完 mode 0</h2><p>在 <code>labs/sgemm/src/kernels.cu</code> 的 sgemm_naive 中完成下列填空。只写第一版；其他两个函数保持待实现。</p><pre><code>const size_t row = /* TODO：输出行 */;
+const size_t col = /* TODO：输出列 */;
+if (/* TODO：越界条件 */)
+    return;
+
+float sum = 0.0f;
+for (size_t p = 0; p &lt; k; ++p)
+{
+    sum += a[/* TODO：A 偏移 */]
+         * b[/* TODO：B 偏移 */];
+}
+c[/* TODO：C 偏移 */] = sum;</code></pre><p>sum 从 0 开始，最后赋值给 C。不要对旧 C 做累加：本实验约定覆盖输出，框架还会用 NaN 标记未写出的位置。<a href="../reference/sgemm-naive.html#implementation">写完后再核对完整参考</a>。</p><p>完成后将 <code>kNaiveImplemented</code> 改为 true，重建并校验：</p><pre><code>cmake --build build --config Release --target sgemm --parallel 1
+.&#92;labs&#92;sgemm&#92;scripts&#92;run_benchmark.ps1 -Modes 0 -Shapes '1x1x1','3x5x7','15x17x19','16x16x16','17x19x23','31x33x29' -CheckOnly -Repeat 1 -SkipBuild</code></pre><p>这些尺寸分别覆盖极小矩阵、非方阵、K 尾部和 block 尾部。只做正确性检查；性能测量仍留到三版完成后统一比较。</p></section>
+<section id="access"><h2>编码后，用一轮 p 的地址检查直觉</h2><p>不要只沿一个线程观察 B 的列访问。固定 p，考察一个完整、有效的 16×16 block 中的首个 warp：线程线性编号为 ty×16+tx，故一个 warp 跨两行。</p><div class="table-wrap"><table><thead><tr><th>lane</th><th>输出行</th><th>输出列</th><th>同一 p 的 A 访问</th><th>同一 p 的 B 访问</th></tr></thead><tbody><tr><td>0～15</td><td>r</td><td>c₀～c₀+15</td><td>相同 A[r,p]</td><td>连续 16 个值</td></tr><tr><td>16～31</td><td>r+1</td><td>c₀～c₀+15</td><td>相同 A[r+1,p]</td><td>同一组连续 16 个值</td></tr></tbody></table></div><p>所以，单线程在不同 p 上对 B 的跨度为 N，不能据此认定当前 warp 的 B 加载是跨步散读。实际 sector 数还取决于对齐、行宽与活跃 lane，不能无条件套用归约的 4 sectors/request。分析方法参考 <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">合并访存说明</a>；上表是对本项目 block 配置的推导。</p>
+<details><summary>为下一课留一个问题：哪些输入被反复使用？</summary><p>固定 A[row,p]，它参与这一行的 N 个输出；固定 B[p,col]，它参与这一列的 M 个输出。下一课将显式组织 block 内的数据复用。硬件缓存和广播已经可能减少实际流量，所以源码中的重复加载次数不等于 DRAM 读取次数，也不能提前承诺 tile 大小倍数的加速。</p></details></section>
+<footer>本节完成标准：能推导三种行主序偏移，写出不重不漏的输出映射，并通过小矩阵检查。推荐主阅读：<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#shared-memory">CUDA Programming Guide §6.2.4，第一段 MatMulKernel</a>；原示例假设尺寸整除，本实验需要边界判断。<br><a href="../reference/sgemm-naive.html">速查</a> · <a href="../RESOURCES.md">资料</a>。任何公式、练习反馈或代码不清楚，都可以把具体问题发给聊天中的老师。</footer>
+<p><a href="0004-shared-gemm.html">下一课：shared-memory tiling，让 block 协作复用输入</a></p>
+</main></body></html>

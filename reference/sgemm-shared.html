@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared-memory SGEMM 速查</title><link rel="stylesheet" href="../assets/teaching.css"></head><body><main>
+<header><div class="eyebrow">CUDA LABS · REFERENCE</div><h1>Shared GEMM：加载、复用、同步</h1><a href="../lessons/0004-shared-gemm.html">返回练习 04</a> · <a href="sgemm-naive.html">朴素版速查</a></header>
+<h2>三个坐标空间</h2><p>T=16，block=(16,16)。row=blockIdx.y×T+ty，col=blockIdx.x×T+tx；段起点 k0=0,T,2T…。线程输出归属不变，加载坐标与计算时读取的坐标不同。</p>
+<div class="table-wrap"><table><tr><th>用途</th><th>global / shared 关系</th><th>合法条件</th></tr><tr><td>加载 As[ty,tx]</td><td>a[row*k+k0+tx]</td><td>row&lt;m &amp;&amp; k0+tx&lt;k</td></tr><tr><td>加载 Bs[ty,tx]</td><td>b[(k0+ty)*n+col]</td><td>k0+ty&lt;k &amp;&amp; col&lt;n</td></tr><tr><td>段内累加</td><td>sum += As[ty,e]*Bs[e,tx]</td><td>e=0…T−1，尾部已补零</td></tr><tr><td>最终写出</td><td>c[row*n+col] = sum</td><td>row&lt;m &amp;&amp; col&lt;n</td></tr></table></div>
+<p>shared 也按行主序展开，行宽 T。单个 extern 数组前 T² 个 float 为 As，后 T² 个为 Bs；本框架启动时已经传入 2048 字节动态 shared。</p>
+<h2>同步不变量</h2><p>每一段所有 shared 槽位都写入有效值或零，再由第一道 block 屏障发布。所有线程读完本段后，经过第二道 block 屏障，下一段才可覆盖。sum 私有且跨段保留；不同线程不归约、不原子加。所有线程都执行同样的 K 段和屏障；本实现不提前 return，只在最终写 C 时裁剪输出。</p>
+<h2 id="implementation">独立完成后再核对</h2><details><summary>查看 sgemm_shared 参考实现</summary><pre><code>__global__ void sgemm_shared(const float* __restrict__ a,
+                             const float* __restrict__ b,
+                             float* __restrict__ c,
+                             size_t m, size_t n, size_t k)
+{
+    constexpr int T = sgemm_config::kSharedTile;
+    extern __shared__ float smem[];
+    float* as = smem;
+    float* bs = smem + T * T;
+    const size_t tx = threadIdx.x;
+    const size_t ty = threadIdx.y;
+    const size_t row = static_cast&lt;size_t&gt;(blockIdx.y) * T + ty;
+    const size_t col = static_cast&lt;size_t&gt;(blockIdx.x) * T + tx;
+
+    float sum = 0.0f;
+    for (size_t k0 = 0; k0 &lt; k; k0 += T)
+    {
+        as[ty * T + tx] = (row &lt; m &amp;&amp; k0 + tx &lt; k)
+            ? a[row * k + k0 + tx] : 0.0f;
+        bs[ty * T + tx] = (k0 + ty &lt; k &amp;&amp; col &lt; n)
+            ? b[(k0 + ty) * n + col] : 0.0f;
+
+        __syncthreads();
+        for (int e = 0; e &lt; T; ++e)
+            sum += as[ty * T + e] * bs[e * T + tx];
+        __syncthreads();
+    }
+
+    if (row &lt; m &amp;&amp; col &lt; n)
+        c[row * n + col] = sum;
+}</code></pre><p>只在完成并检查后启用 kSharedImplemented；实际源码仍由你手写。第二道屏障在最后一段之后可以省去，本参考统一保留。此实现契合当前固定 T×T block 与资源配置；不能只改 block 大小而不修改加载覆盖关系。</p></details>
+<h2>性能假设的边界</h2><p>完整 T×T 输出 tile 的一段 K：T³ 次乘加，global 输入标量读取由源码层面 2T³ 次变成 2T² 次。T=16 时从 8192 次变为 512 次。此计数不包括 C 写回，也不是缓存后 DRAM 字节统计；尾部会有无效线程和补零乘加。shared 版引入 shared 读写和 block 屏障，是否加速必须实测。</p><p>先建立显式输入复用，不套用转置的自动加一列 padding，也不预设 bank conflict 是瓶颈。后续按实际访问地址与 profiler 数据诊断；本节不扩展到寄存器分块、异步拷贝或 Tensor Core。</p>
+<p>依据：<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#shared-memory">官方 tiled MatMulKernel</a> · <a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#synchronization-functions">同步规则</a> · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab">输入复用案例</a>。尾部处理、动态 shared 布局和计数按本项目接口推导。</p>
+<footer><a href="../lessons/0004-shared-gemm.html">返回课件与验证命令</a>。通过检查后，回到聊天解释两道屏障各自保护的依赖，再进入 register tiling。</footer>
+</main></body></html>

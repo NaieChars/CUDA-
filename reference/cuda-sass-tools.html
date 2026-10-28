@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CUDA 汇编阅读与工具速查</title><link rel="stylesheet" href="../assets/teaching.css"></head>
+<body><main>
+<header><div class="eyebrow">CUDA LABS · 参考 06 · 2026-10-19</div><h1>SASS、工具与计数速查</h1><p class="lede">用于复习与复现。首次学习请按 <a href="../lessons/0006-sass-performance-evidence.html">第 06 课</a> 逐段完成；这里不代表已经掌握。</p></header>
+<section id="glossary"><h2>统一术语</h2>
+<div class="table-wrap"><table><thead><tr><th>术语</th><th>含义</th></tr></thead><tbody>
+<tr><td>机器码</td><td>硬件指令的二进制编码</td></tr>
+<tr><td>汇编 / 反汇编</td><td>低层操作的可读表示 / 将机器码转成可读指令文本</td></tr>
+<tr><td>PTX</td><td>虚拟指令集的中间表示；虚拟寄存器不等于硬件分配</td></tr>
+<tr><td>SASS</td><td>目标 GPU 实际机器指令的可读文本</td></tr>
+<tr><td>cubin / fatbin</td><td>设备代码对象 / 可容纳多种设备代码表示的容器</td></tr>
+<tr><td>PC / 指令偏移</td><td>指令位置 / 函数内的相对位置；不是耗时</td></tr>
+<tr><td>谓词</td><td>控制参与执行的条件；@P0 为真，@!P0 为假</td></tr>
+<tr><td>依赖链</td><td>一条指令产生的值被后续指令使用</td></tr>
+<tr><td>静态指令数</td><td>反汇编中所数的指令位置数</td></tr>
+<tr><td>动态 warp 指令数</td><td>运行时各 warp 执行指令的累计次数</td></tr>
+<tr><td>pred-on 线程指令数</td><td>参与执行、谓词为真的线程操作累计次数</td></tr>
+<tr><td>warp sampling</td><td>周期性采样 warp 状态并关联指令位置，不是逐条计时</td></tr>
+</tbody></table></div>
+<p>来源：<a href="https://docs.nvidia.com/cuda/archive/12.8.1/parallel-thread-execution/index.html#introduction">PTX ISA</a>、<a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-binary-utilities/index.html">Binary Utilities</a>、<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html">NCU Profiling Guide</a>。具体寄存器与计数对应由本项目 SASS 和旧报告验证。</p></section>
+<section id="syntax"><h2>最小阅读词表</h2>
+<pre>LDS R28, [R27+0x400];    // 读 shared 的 32 bit 值到 R28
+LDS.128 R8, [R0];        // 每参与线程读 16 字节 → R8..R11
+STS [R26], R33;          // 写 shared，目的地址在前
+LDG / STG               // global load / store 指令族
+FFMA R8, R8, R28, R29;   // 新 R8 = 旧 R8×R28+R29
+@!P0 BRA 0x2a0;          // P0 假时参与跳转
+BAR.SYNC…               // 识别 block 同步；完整后缀按架构解释
+MOV / IADD / ISETP      // 搬值 / 整数加 / 比较设谓词
+RZ / UR                 // 零寄存器 / uniform 寄存器命名
+
+0x10=16，0x40=64，0x400=1024；本例地址偏移按字节
+一个 float=4 字节；LDS.128 中 128 的单位是 bit</pre>
+<p>R8 是每线程的寄存器操作数，不是整个 warp 的共享变量；相同 R 编号可以在不同阶段装不同值。完整 SASS 的编码和调度注记不等于 profiler 耗时。<code>.reuse</code> 是寄存器操作数复用相关标记，不能拿来证明某级内存缓存命中。</p></section>
+<section id="commands"><h2>Windows PowerShell 最短命令路径</h2>
+<p>工作目录：<code>D:\CG\Kernel_Optimization\cuda-labs</code>。本机 Binary Utilities 12.8.55、NCU 2025.2。命令名不可用时使用绝对路径和调用运算符 &amp;。</p>
+<pre><code>Get-Command cuobjdump.exe, nvdisasm.exe, ncu.bat, ncu-ui.bat
+cuobjdump.exe --version
+cuobjdump.exe --dump-resource-usage '.\build\labs\sgemm\Release\sgemm.exe'
+cuobjdump.exe --dump-sass --function _Z12sgemm_sharedPKfS0_Pfyyy '.\build\labs\sgemm\Release\sgemm.exe' | Out-Host -Paging</code></pre>
+<p>找 <code>arch=sm_120</code>、shared 函数、0x3a0～0x600。main.cu 编译单元可能提示函数未找到，继续核对 kernels.cu 单元。分页用空格继续，Q 退出。</p>
+<pre><code>$lessonReport = '.\labs\sgemm\result\20261019_210502_515_application_warm_f8fb2cb2\shared_m1024_n1024_k1024_run01.ncu-rep'
+&amp; 'C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.2.0\ncu.bat' --import $lessonReport --page raw --csv --metrics smsp__sass_inst_executed_op_shared_ld.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum</code></pre>
+<p>导入旧报告，输出两列原始数据；不会启动 kernel。已核对结果为 41,943,040 和 1,073,741,824。主工具路径：<code>C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\cuobjdump.exe</code>。</p>
+<details><summary>nvdisasm 的后续入口：只理解输入与产物</summary><p>先用 <code>cuobjdump.exe --list-elf &lt;exe路径&gt;</code> 列出嵌入的 cubin；再在自己新建的实验目录中用 <code>cuobjdump.exe --extract-elf &lt;列表里的精确文件名&gt; &lt;exe绝对路径&gt;</code> 提取；最后用 <code>nvdisasm.exe &lt;提取出的cubin路径&gt;</code> 查看。尖括号是待替换说明，不能直接复制执行。<code>nvdisasm.exe --print-line-info &lt;cubin路径&gt;</code> 可在文件带行信息时显示关联；控制流图等功能放到以后。主课无需提取文件，备课未运行这组可选流程。</p></details>
+</section>
+<section id="gui"><h2>GUI 导航与缺失信息</h2>
+<pre><code>&amp; 'C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.2.0\ncu-ui.bat' $lessonReport</code></pre>
+<p>或 File → Open。Summary 确认 kernel / grid / block → Source → View 选 SASS 或 Source 与 SASS 并排 → 选 kernels.cu/shared → 找 LDS.128 与 FFMA → Raw 看完整指标名。</p>
+<p>File Not Found：选择文件，使用 Resolve 指向快照。File Mismatch：核对版本。PTX 视图不可用可先跳过。没有 PC 采样列：核查采集内容；不把 N/A 当零。本项目已有 -lineinfo，不为关联改用调试构建。</p>
+<p>来源：<a href="https://docs.nvidia.com/nsight-compute/NsightCompute/index.html#source-page">Source Page 手册</a>；本机对应文件为 <code>C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.2.0\docs\NsightCompute\index.html</code>。备课核查手册与 CLI，未完成 GUI 实际操作验证。</p></section>
+<section id="formulas"><h2>shared 版的计数公式</h2>
+<p>以下仅适用于本课这份 sm_120 SASS、block=16×16、BK=16、所有线程参与 tile 计算的实现。改代码或编译器后，重新检查指令体。</p>
+<pre>每线程每 K 段：
+  A：4 条 LDS.128 → 16 个 float
+  B：16 条 LDS    → 16 个 float
+  load 指令合计：20；标量操作数合计：32
+
+B = ceil(M/16) × ceil(N/16)       // block 数
+W = 256/32 = 8                   // warp/block
+Q = ceil(K/16)                   // K 段数
+
+shared load 动态 warp 指令 = B×W×Q×20
+FFMA 动态 warp 指令        = B×W×Q×16
+FFMA pred-on 线程指令      = B×W×Q×16×32
+
+完整 1024³：load=41,943,040；线程 FFMA=1,073,741,824
+完整  512³：load= 5,242,880；线程 FFMA=  134,217,728
+尾部 1023×1009×1031：load=42,598,400；线程 FFMA=1,090,519,040</pre>
+<p>512³ 和尾部数字是课堂预测，未新增采集验证。逻辑 GEMM 常用 FLOP 分子是 2MNK；尾部补零会使实际执行工作多于逻辑有效工作。</p>
+<p>读取宽度 × 指令数 × lane 数得到的是逐 lane 的逻辑读取量，不能直接得到不同地址字节数、bank wavefront、缓存 sector 或 DRAM 字节。这些各自需要对应口径的观测。</p></section>
+<section id="evidence"><h2>证据与结论模板</h2>
+<pre>问题：我预测哪一项工作会怎样变化？
+版本：源码、exe、报告分别来自哪里，是否对应？
+预测：公式、单位、参与条件。
+观察：具体命令和原始值。
+结论：已确认 / 有支持 / 待验证。
+下一步：什么最小观测能区分剩下的解释？</pre>
+<p>静态 SASS 能确认生成了什么；动态计数能验证运行的工作量；普通计时判断整体时间；逐 PC 样本能提供定位线索，仍要分析依赖。采样热点可能位于消费结果的指令，不能凭热点宣布根因。</p>
+<p>小收益：A/A 看测量波动，交错 A/B 或 AB/BA 看配对差值；进程内多次启动的均值不增加独立轮次数。区间跨零表示本批不足以稳定判断方向，不证明无效或等效。</p></section>
+<section id="files"><h2>本课原始材料</h2>
+<ul><li><a href="../labs/sgemm/result/20261019_205959_analysis/sass_and_resources.txt">SASS 与资源导出</a></li>
+<li><a href="../labs/sgemm/result/20261019_205959_analysis/source_snapshot/kernels.cu">对应源码快照</a></li>
+<li><a href="../labs/sgemm/result/20261019_210502_515_application_warm_f8fb2cb2/shared_m1024_n1024_k1024_run01.ncu-rep">shared 1024³ 旧报告</a></li>
+<li><a href="../labs/sgemm/docs/性能指标汇总.md">统一报告：第 1～3 节结论与限制，第 5 节审计</a></li></ul>
+<p>备课核对的 exe SHA256：<code>FB4733B4868AB92BD01B1B3F96FC7E835E381234DED9C4EDF57E87C72B753A54</code>。当前 kernels.cu 与快照 SHA256：<code>AB141947FD5607DBFE85DCF772B425CF76B2074EE0F037E53552A4D14A30E4FE</code>。</p></section>
+<footer><a href="../lessons/0006-sass-performance-evidence.html">回到课堂</a> · <a href="../RESOURCES.md">一手资料</a>。拿着一条指令、一项公式或一个错误输出，随时向老师追问。</footer>
+</main></body></html>

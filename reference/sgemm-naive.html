@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>朴素 SGEMM 速查</title><link rel="stylesheet" href="../assets/teaching.css"></head><body><main>
+<header><div class="eyebrow">CUDA LABS · REFERENCE</div><h1>朴素 SGEMM：索引与职责</h1><a href="../lessons/0003-naive-gemm.html">返回练习 03</a> · <a href="../labs/sgemm/README.md">实验接口</a></header>
+<h2>最少需要记住的关系</h2><div class="table-wrap"><table><tr><th>项目</th><th>含义 / 表达式</th></tr><tr><td>M / N / K</td><td>输出行数 / 输出列数 / 点积长度</td></tr><tr><td>A[M,K]</td><td>a[row*k+p]</td></tr><tr><td>B[K,N]</td><td>b[p*n+col]</td></tr><tr><td>C[M,N]</td><td>c[row*n+col]</td></tr><tr><td>一个线程</td><td>一个 C 元素，私有 sum 遍历整个 K</td></tr><tr><td>一个 block</td><td>16×16 个输出，沿 M/N 尾部裁剪</td></tr><tr><td>同步</td><td>无跨线程中间数据依赖；本版无需 block 屏障</td></tr></table></div>
+<h2 id="implementation">先自行推导，再展开核对</h2><details><summary>查看 sgemm_naive 参考实现</summary><pre><code>__global__ void sgemm_naive(const float* __restrict__ a,
+                            const float* __restrict__ b,
+                            float* __restrict__ c,
+                            size_t m, size_t n, size_t k)
+{
+    const size_t row = static_cast&lt;size_t&gt;(blockIdx.y)
+                     * blockDim.y + threadIdx.y;
+    const size_t col = static_cast&lt;size_t&gt;(blockIdx.x)
+                     * blockDim.x + threadIdx.x;
+    if (row &gt;= m || col &gt;= n)
+        return;
+
+    float sum = 0.0f;
+    for (size_t p = 0; p &lt; k; ++p)
+        sum += a[row * k + p] * b[p * n + col];
+
+    c[row * n + col] = sum;
+}</code></pre><p>写完后再启用 kNaiveImplemented，保持另两版 false。此处提供的是学习参考，实际 src/kernels.cu 仍由你手写。</p></details>
+<h2>先检查这四处</h2><p>A 的行宽是 K，B/C 的行宽是 N；grid.x 对应 col；每个 sum 都从 0 开始；输出使用赋值，覆盖旧 C。n=1 或 K 非整除都不需要特殊求和逻辑，本版的 p 循环只遍历真实 K。</p>
+<h2>访存判断</h2><p>项目 block=(16,16)，一个 warp 跨两行。固定 p 时，每半个 warp 读取相同的 A 元素，B 为连续的 16 个值，另一半 warp 读取相同的 B 地址组。跨 p 的单线程跨度不直接决定跨 lane 的合并情况；缓存命中和 DRAM 流量留给测量。</p>
+<h2>符号与数值</h2><p>本实验是行主序 FP32 的 C=AB。通用 GEMM 常含 alpha、beta 和转置选项，本阶段接口不含这些扩展。按常用口径，吞吐分子为 2MNK FLOP；源码里的 sum += a*b 可能被编译器融合为 FMA，具体指令由编译结果决定。</p>
+<p>原始依据：<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#shared-memory">官方矩阵乘法与行主序示例</a> · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory">合并访存说明</a> · <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab">后续复用背景</a>。warp 地址模式与尾部处理是结合本项目配置进行的推导。</p><footer>完成后回到聊天，发送你的 kernel 或索引解释以获得反馈。<a href="../lessons/0003-naive-gemm.html">返回练习</a></footer>
+</main></body></html>

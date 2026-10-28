@@ -22,13 +22,21 @@ th { font-weight: 600; }
 .exercise { border-top: 1px solid var(--rule); padding: 18px 0; }
 .exercise label { display: inline-flex; gap: 8px; align-items: center; margin: 5px 16px 5px 0; }
 input { width: 7em; }
-input,button { font: inherit; color: var(--ink); background: var(--paper); border: 1px solid var(--rule); border-radius: 4px; padding: 6px 10px; }
+input,button,select { font: inherit; color: var(--ink); background: var(--paper); border: 1px solid var(--rule); border-radius: 4px; padding: 6px 10px; }
 button { cursor: pointer; }
 button:hover { background: var(--wash); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .feedback { min-height: 1.8em; color: var(--muted); }
 .lane-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 6px; font-size: 13px; font-variant-numeric: tabular-nums; }
 .lane-cell { background: var(--wash); padding: 6px; }
+.matrix-layout { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 16px; }
+.matrix-layout figure { margin: 12px 0; min-width: 0; }
+.matrix-layout figcaption { color: var(--muted); margin-bottom: 8px; }
+.matrix-layout td { text-align: center; padding: 7px; }
+.matrix-layout .matrix-active { background: var(--wash); color: var(--accent); font-weight: 600; }
+.demo-controls { display: flex; gap: 16px; flex-wrap: wrap; }
+.demo-controls label { display: inline-flex; align-items: center; gap: 8px; }
+@media(max-width: 620px) { .matrix-layout { grid-template-columns: 1fr; } }
 button:disabled { opacity: .5; cursor: default; }
 @media(min-width: 700px) { .lane-grid { grid-template-columns: repeat(8,minmax(0,1fr)); } }
 details { padding: 14px 0; }

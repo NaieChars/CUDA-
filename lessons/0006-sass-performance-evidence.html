@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>从零读 SASS，到验证 GEMM 工作量 · CUDA 第 06 课</title>
+<link rel="stylesheet" href="../assets/teaching.css">
+<script defer src="../assets/retrieval.js"></script><script defer src="../assets/sass-evidence.js"></script></head>
+<body><main>
+<header><div class="eyebrow">CUDA LABS · 第 06 课 · 汇编与工具零基础</div>
+<h1>从源码到机器指令，亲手接上一条证据链</h1>
+<p class="lede">建议 100～120 分钟，含一次休息。围绕你已写好的 shared GEMM，学会导出、读懂一小段 SASS，并独立验证 shared-load 计数。这里假定你从未学过汇编，也没有用过反汇编工具。</p>
+<p>本节的实际收获：面对“源码有 32 次标量读取，为什么反汇编只有 20 条 shared load？”能自己找材料、做推导、核对报告，并说明这个结果能支持多强的结论。它服务于 <a href="../MISSION.md">独立解释、验证 CUDA 优化</a> 的长期目标。</p>
+<p><a href="0005-register-gemm.html">上一课：线程内外积复用</a> · <a href="../reference/cuda-sass-tools.html">本节术语与命令速查</a> · <a href="../labs/sgemm/docs/性能指标汇总.md">已有性能报告</a></p></header>
+
+<section id="route"><h2>课堂路线：内容加量，主线保持连贯</h2>
+<div class="table-wrap"><table><thead><tr><th>段落</th><th>时间</th><th>你要做出的东西</th></tr></thead><tbody>
+<tr><td><a href="#layers">1 · 编译与汇编基础</a></td><td>12 分钟</td><td>画出 CUDA C++ → PTX → SASS</td></tr>
+<tr><td><a href="#tools">2 · 工具第一次使用</a></td><td>15 分钟</td><td>找到 shared 函数的反汇编</td></tr>
+<tr><td><a href="#grammar">3 · 读一条指令</a></td><td>18 分钟</td><td>辨认地址、寄存器、谓词和宽度</td></tr>
+<tr><td><a href="#dataflow">4 · 追踪值与依赖</a></td><td>15 分钟</td><td>跟住两次乘加中的部分和</td></tr>
+<tr><td>中场休息</td><td>5 分钟</td><td>离开屏幕，回忆三个新术语</td></tr>
+<tr><td><a href="#count">5 · 从静态片段到动态计数</a></td><td>20 分钟</td><td>算出并核对 41,943,040</td></tr>
+<tr><td><a href="#gui">6 · Nsight Compute 图形界面</a></td><td>12 分钟</td><td>找到 Source / SASS 与 Raw</td></tr>
+<tr><td><a href="#reasoning">7 · 性能推理与测量延伸</a></td><td>13 分钟</td><td>写出有边界的结论和下一步观测</td></tr>
+<tr><td><a href="#exit">8 · 独立迁移与回忆</a></td><td>10 分钟</td><td>在 512³ 上预测另一组计数</td></tr>
+</tbody></table></div>
+<p>时间是估计，可随提问调整。每段按“老师解释 → 你先预测 → 操作 → 反馈”推进。前三段解决入门门槛，后半节在同一个例子上加深。若工具卡住，可直接用已有文本继续推理，课后再补工具动作。</p>
+<p class="note">这一页是完整课件，也可作为逐段授课提纲。不要先展开所有答案；遇到不明白的地方，直接在聊天中贴出那条指令或你的推导，让老师就地解释。课件生成不代表你已经掌握。</p></section>
+
+<section id="layers"><h2>1 · 先知道自己正在读哪一层</h2>
+<h3>程序、机器码、汇编、反汇编</h3>
+<p>你写的 <code>sum += a * b;</code> 表达要算什么；GPU 最终接收的是按其指令格式编码的机器码。<strong>汇编</strong>用可读的名称、寄存器和操作数描述这些低层操作。把机器码转换为可读指令文本的过程叫<strong>反汇编</strong>。我们先练阅读，不需要先会手写汇编。</p>
+<p>把它理解成“检查编译器最终安排了哪些操作”很合适。反汇编通常不能还原原来的变量名、循环写法和注释；编译器可能展开循环、合并加载、重用寄存器、调整指令顺序。</p>
+<pre>你写的 CUDA C++（kernels.cu）
+           ↓ 编译前端
+PTX：面向虚拟指令集的中间表示；寄存器也是虚拟的
+           ↓ ptxas / 后续机器码生成
+目标 GPU 的机器码，存放于 cubin 等设备代码对象中
+           ↓ cuobjdump / nvdisasm 反汇编
+SASS：目标 GPU 机器指令的可读文本
+
+另一条可能路径：程序携带 PTX → 驱动 JIT → 当前设备的机器码</pre>
+<p><code>sgemm.exe</code> 同时含主机程序和设备代码；cubin 是设备代码对象，不等于整个 exe。PTX 有助于理解语义，但一条 PTX 不保证对应一条 SASS；PTX 的虚拟寄存器数也不等于硬件寄存器用量。本课的计数对象是实际 <code>sm_120</code> 编译结果。<a href="https://docs.nvidia.com/cuda/archive/12.8.1/parallel-thread-execution/index.html#introduction">一手依据：PTX ISA Introduction</a>。</p>
+<p><code>sm_120</code> 指目标 GPU 架构，不是“120 个 SM”。<code>/*03c0*/</code> 是函数内指令偏移，不是源码第 3c0 行，也不是耗时。右侧的 <code>0x...</code> 是机器编码；今天不需要按位解码。</p>
+<details><summary>第一轮口头检查：SASS 和 PTX 各回答什么？</summary><p>PTX 帮你看中间层的操作语义；实际 SASS 帮你检查某个目标版本最终生成的指令。两者都不是逐周期执行录像，也不能仅凭文本知道哪条指令花了多少时间。</p></details>
+</section>
+
+<section id="tools"><h2>2 · 工具第一次使用：每条命令都有明确产物</h2>
+<p>以下命令在仓库根目录的 PowerShell 执行。2026-10-19 备课已确认：本机可找到 <code>cuobjdump.exe</code>、<code>nvdisasm.exe</code>、<code>ncu.bat</code>、<code>ncu-ui.bat</code>。Binary Utilities 为 12.8.55，Nsight Compute 为 2025.2；工具小版本不必与 nvcc 字符串逐字相同。</p>
+<div class="table-wrap"><table><thead><tr><th>工具</th><th>你用它回答什么</th><th>本节位置</th></tr></thead><tbody>
+<tr><td>cuobjdump</td><td>exe 里有哪些设备指令和资源声明？</td><td>主工具，马上使用</td></tr>
+<tr><td>nvdisasm</td><td>独立 cubin 的反汇编、控制流是什么？</td><td>认识用途，提取流程放速查</td></tr>
+<tr><td>ncu</td><td>采集指标或读取已有 .ncu-rep</td><td>本节只读取已有报告</td></tr>
+<tr><td>ncu-ui</td><td>在图形界面关联源码、SASS 和指标</td><td>第 6 段实际操作</td></tr>
+</tbody></table></div>
+<p>文件格式和输入范围以 <a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-binary-utilities/index.html">CUDA 12.8 Binary Utilities</a> 为准。<code>nvdisasm sgemm.exe</code> 不是本课的入口；先用能直接读取主机 exe 的 cuobjdump。</p>
+<h3>2.1 · 找到工具与实验产物</h3>
+<pre><code>Set-Location 'D:\CG\Kernel_Optimization\cuda-labs'
+Get-Command cuobjdump.exe, nvdisasm.exe, ncu.bat, ncu-ui.bat
+cuobjdump.exe --version
+Test-Path '.\build\labs\sgemm\Release\sgemm.exe'</code></pre>
+<p>预期：显示工具路径，版本含 12.8，最后一行 <code>True</code>。若命令找不到，使用下面的绝对路径；不必先重装工具。若 exe 不存在，先看保存的 SASS 文本，暂时跳过实时导出。</p>
+<pre><code>&amp; 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\cuobjdump.exe' --version</code></pre>
+<p><code>&amp;</code> 是 PowerShell 的调用运算符；引号保证含空格的路径被当作一个路径。</p>
+<h3>2.2 · 先看到设备架构，再只看一个函数</h3>
+<pre><code>cuobjdump.exe --dump-resource-usage '.\build\labs\sgemm\Release\sgemm.exe'
+cuobjdump.exe --dump-sass --function _Z12sgemm_sharedPKfS0_Pfyyy '.\build\labs\sgemm\Release\sgemm.exe' | Out-Host -Paging</code></pre>
+<p>第一条应看到 <code>arch = sm_120</code> 和三个 kernel 的资源。shared 函数的实测导出含 <code>REG:38 STACK:0 SHARED:1024 LOCAL:0</code>。这个 <code>SHARED:1024</code> 不能直接解释成用户 tile 的动态请求量；已有报告区分了驱动部分和 launcher 请求。</p>
+<p>第二条应进入 <code>Function : _Z12sgemm_sharedPKfS0_Pfyyy</code>。这是 C++ 编码后的符号名，里面仍能辨认 <code>sgemm_shared</code>，不需要背后缀。分页继续按空格，退出按 Q。exe 含多个编译单元，对 main.cu 单元可能提示该函数找不到；继续确认 kernels.cu 单元是否成功列出函数即可。</p>
+<p>只想先读已有材料，用文本编辑器打开 <a href="../labs/sgemm/result/20261019_205959_analysis/sass_and_resources.txt">保存的 SASS</a>，搜索完整 <code>Function : _Z12sgemm_sharedPKfS0_Pfyyy</code>，再找 <code>/*03a0*/</code>。注意别读成 register 版本。</p>
+<h3>2.3 · 证据来自同一个版本</h3>
+<pre><code>Get-FileHash '.\build\labs\sgemm\Release\sgemm.exe' -Algorithm SHA256
+Get-FileHash '.\labs\sgemm\src\kernels.cu' -Algorithm SHA256
+Get-FileHash '.\labs\sgemm\result\20261019_205959_analysis\source_snapshot\kernels.cu' -Algorithm SHA256</code></pre>
+<p>备课时 exe 与 <a href="../labs/sgemm/docs/性能指标汇总.md">报告第 5 节</a> 的哈希一致，源码也与快照相同。如果将来不同，优先用旧报告配旧快照完成本课；新编译结果可另行分析。不能把新源码、旧 SASS、旧计数随意拼在一起。</p>
+<p class="note">本节所有已核对的导出和 import 都是读取文件；没有运行 kernel 或重采性能。你练习时也先完成这条最短工具路径。</p>
+</section>
+
+<section id="grammar"><h2>3 · 一行指令到底怎么读？</h2>
+<p>先读“操作名 → 写哪里 → 从哪里取值 → 是否有条件”。对下面 LDS / FFMA，目的操作数在前；不要把这个位置规则机械套到 store 上。</p>
+<pre>/*03b0*/ LDS     R28, [R27+0x400];
+/*03c0*/ LDS.128 R8,  [R0];
+/*0420*/ FFMA    R8,  R8, R28, R29;
+/*0600*/ @!P0 BRA 0x2a0;</pre>
+<p>这些来自你的 shared kernel；为了阅读，省去了编码和调度注记，指令语义操作数保持原样。完整行中的 <code>&amp;wr</code>、<code>&amp;req</code>、<code>?trans</code>、<code>?WAIT</code> 先跳过；它们不是 profiler 实测的纳秒数。</p>
+<div class="table-wrap"><table><thead><tr><th>写法</th><th>本课读法</th><th>一个常见误会</th></tr></thead><tbody>
+<tr><td>R8、R28</td><td>线程的通用寄存器操作数</td><td>R8 不是整个 warp 共享的一个变量</td></tr>
+<tr><td>[R27+0x400]</td><td>访问地址 R27+1024 处的内存</td><td>方括号表示取内存，不是普通相加</td></tr>
+<tr><td>0x10 / 0x40 / 0x400</td><td>16 / 64 / 1024；此处地址偏移按字节</td><td>+0x10 不是跨 16 个 float</td></tr>
+<tr><td>P0、@P0、@!P0</td><td>谓词；条件真 / 条件假时执行</td><td>谓词不是指针，也不是线程编号</td></tr>
+<tr><td>LDS / STS</td><td>shared → 寄存器 / 寄存器 → shared</td><td>STS 的第一个操作数是写入地址</td></tr>
+<tr><td>LDG / STG</td><td>global 加载 / 存储指令族</td><td>指令数不等于 DRAM 事务数</td></tr>
+<tr><td>FFMA D,A,B,C</td><td>D ← A×B+C，FP32 融合乘加</td><td>不是三个操作数的连乘</td></tr>
+<tr><td>BRA / BAR.SYNC…</td><td>控制流跳转 / block 同步屏障</td><td>BRA 与 BAR 不是同一种操作</td></tr>
+<tr><td>MOV / IADD / ISETP</td><td>搬值 / 整数加 / 比较并设置谓词</td><td>不是每条指令都在做浮点数学</td></tr>
+</tbody></table></div>
+<p>指令族可查 <a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-binary-utilities/index.html#instruction-set-reference">官方指令参考</a>；具体片段和架构以本机导出为准。<code>RZ</code> 表示零寄存器，<code>UR</code> 是 uniform 寄存器命名；初次遇见先认出类别，不在本课展开其分配规则。</p>
+<h3>3.1 · LDS.128 的 128 是什么？</h3>
+<p>这里 <code>LDS R28,[...]</code> 对每个参与线程取一个 32 bit 的值；<code>LDS.128 R8,[R0]</code> 对每个参与线程取 128 bit，即 16 字节，在这个 FP32 例子中是四个相邻 float，写入 <code>R8,R9,R10,R11</code>。它仍是一条 SASS 指令。128 不是“128 个线程”或“128 条指令”。</p>
+<p>在满 warp、32 个 lane 都参与时，一次 LDS.128 对应 32×16=512 字节的<strong>逐 lane 逻辑读取量之和</strong>；不同 lane 可以读重复地址，不能因此说有 512 字节不同的数据，更不能说一次就发生一个 512 字节物理事务。</p>
+<form class="exercise" data-retrieval data-correct="正确：128 bit ÷ 8=16 字节，16 ÷ 4=4 个 float。" data-retry="先把 bit 换成字节，再除以每个 float 的 4 字节。"><p><strong>练习 1：</strong>单个参与线程执行一次 LDS.128，读取多少字节、多少个 float？</p><label>字节 <input type="number" required data-answer="16"></label><label>float 个数 <input type="number" required data-answer="4"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form>
+<form class="exercise" data-retrieval data-correct="正确：0x40=64 字节，64/4=16 个 float；这正好是当前 Bs 一行的宽度。" data-retry="十六进制 0x40 是 4×16；这里偏移单位是字节。"><p><strong>练习 2：</strong>地址从 0x400 到 0x440，跨多少字节、多少个 float？</p><label>字节 <input type="number" required data-answer="64"></label><label>float 个数 <input type="number" required data-answer="16"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form>
+<h3>3.2 · 谓词和循环</h3>
+<p><code>@!P0 BRA 0x2a0</code> 表示相应 lane 的 P0 为假时参与该跳转，目标是当前函数内 0x2a0。反汇编中的 0x600 跳回更小偏移，是循环回边的线索。还需要追查 P0 由哪个比较设置，才能说它代表什么条件。</p>
+<p>本函数在 <code>/*0340*/</code> 将 K 段位置加 0x10，在 <code>/*0360*/</code> 比较是否到达 K，随后在 <code>/*0600*/</code> 判断是否回到下一段。这些线索与源码 <code>k0 += 16</code> 对应。别见到 P0 就想当然地把它解释成某个源码 if；同一个谓词寄存器也会被复用。</p>
+</section>
+
+<section id="dataflow"><h2>4 · 读指令片段：数据从哪来，又被谁使用？</h2>
+<h3>4.1 · 为什么 A 可以宽加载，B 仍多为标量加载？</h3>
+<pre>// shared 版的内层数学循环
+for (int e = 0; e &lt; 16; ++e)
+    sum += as[16 * ty + e] * bs[16 * e + tx];</pre>
+<p>固定一个线程，沿 e 观察：A 相邻项只差 1 个 float（4 字节），B 相邻项差 16 个 float（64 字节）。<strong>这是同一线程跨 e 的地址关系</strong>；与同一时刻多个 lane 的合并访存问题要分开。这里的编译结果将 A 的四个连续 e 项合成 LDS.128，而 B 仍逐项 LDS。</p>
+<p>本二进制中，A 地址由 R0 形成，B 地址由 R27 加偏移形成；前面的地址构造和源码布局、16 字节与 64 字节的步长共同支持这个对应。单凭一个寄存器名字无法判断 A/B。</p>
+<pre>/*03a0*/ BAR.SYNC.DEFER_BLOCKING 0x0;
+/*03b0*/ LDS     R28, [R27+0x400];  // B 的当前 e
+/*03c0*/ LDS.128 R8,  [R0];         // A 的四个连续 e → R8..R11
+/*03d0*/ LDS     R32, [R27+0x440];  // B 的下一 e
+// 若干其他加载省略
+/*0420*/ FFMA R8, R8, R28, R29;
+// 一条其他加载省略
+/*0440*/ FFMA R9, R9, R32, R8;
+...
+/*05f0*/ BAR.SYNC.DEFER_BLOCKING 0x0;
+/*0600*/ @!P0 BRA 0x2a0;</pre>
+<p>两道 BAR 对应当前程序的 block 同步结构。优化后指令可能跨源码行交错，屏障的完整后缀也涉及架构语义；本课只要求识别同步位置，不把它简化成“屏障前所有算术都已全部结束”。</p>
+<h3>4.2 · R8 不是永远等于变量 a</h3>
+<p>在 0x3c0 后，R8 装着一个 A 元素；0x420 的 FFMA 先读取旧 R8，再把部分和写回 R8。下一条 FFMA 用新 R8 当加数。寄存器名字是可复用的存储位置，不是固定源码变量名。</p>
+<div class="exercise" data-sass-stepper><h3>一步步追踪：先预测，再按按钮</h3>
+<p>真实指令片段，配<strong>人为设定</strong>的 lane 0 数值：A 前四项为 2、3、5、7，B 前两项为 11、13，进入片段的旧部分和为 17。这不是旧实验输入或硬件轨迹；省略的指令不影响所展示的依赖。</p>
+<pre data-instruction>启用 JavaScript 可逐步执行。</pre><pre data-registers>初始 R0=0x0，R27=0x0，R29=17。</pre>
+<button type="button" data-step>执行下一步</button> <button type="button" data-reset>重置</button><p role="status" aria-live="polite" class="feedback"></p>
+<noscript><p>0x3b0 后 R28=11；0x3c0 后 R8..R11=2,3,5,7；0x3d0 后 R32=13；0x420 后 R8=39；0x440 后 R9=78。</p></noscript></div>
+<form class="exercise" data-retrieval data-correct="正确：新 R8=2×11+17=39；新 R9=3×13+39=78。第二次乘加依赖前一次产生的部分和。" data-retry="第二条必须使用第一条写回的新 R8；别继续使用 A 的旧值 2。"><p><strong>练习 3：</strong>不看演示，算两次 FFMA 后的值。</p><label>新 R8 <input type="number" required data-answer="39"></label><label>新 R9 <input type="number" required data-answer="78"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form>
+<p>现在能画出两种依赖：<code>LDS → 使用加载结果的 FFMA</code>，以及 <code>FFMA → 下一条累加 FFMA</code>。这说明<strong>等待可能发生在哪里</strong>，尚未证明硬件实际等了多久。旧报告中的 long/short scoreboard 总量也不能直接贴到这几条指令上。</p>
+<p class="note">休息前闭上课件：说清“方括号”“谓词”“寄存器覆盖写”各是什么意思。暂时答不出，就回到对应例子，不需要背指令表。</p>
+</section>
+
+<section id="count"><h2>5 · 主实验：32 次标量读取，为何只有 20 条 load？</h2>
+<h3>5.1 · 先固定所有计数单位</h3>
+<p>本段只研究 <strong>shared 版，M=N=K=1024，block=16×16，BK=16</strong>。所有 tile 都完整，没有尾部裁剪。先区分下面四个量：</p>
+<div class="table-wrap"><table><thead><tr><th>量</th><th>你在数什么</th><th>本段例子</th></tr></thead><tbody>
+<tr><td>源码标量读取</td><td>一个线程读到多少个 float 操作数</td><td>每 K 段 A/B 各 16 个</td></tr>
+<tr><td>静态指令</td><td>反汇编里一个位置的一条指令</td><td>K 段体中 20 条 shared load</td></tr>
+<tr><td>动态 warp 指令</td><td>每个 warp 运行该指令的次数</td><td>20×段数×warp 数×block 数</td></tr>
+<tr><td>pred-on 线程指令</td><td>谓词为真的参与线程操作数</td><td>满 warp 的 FFMA 每次有 32 个</td></tr>
+</tbody></table></div>
+<p>profiler 显示 <code>inst</code> 时仍要读完整指标名，warp 与 thread 的分母不同。本课使用的 shared load 指标是 <code>smsp__sass_inst_executed_op_shared_ld.sum</code>；FFMA 用 <code>smsp__sass_thread_inst_executed_op_ffma_pred_on.sum</code>。前者不能再随手乘 32 后仍称为同一个指标。指标结构与采样区别参见 <a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-structure">Profiling Guide</a>。</p>
+<h3>5.2 · 源码模型与机器模型各算一次</h3>
+<p>源码：每线程每段读 A 16 次、B 16 次，共 32 个 float 操作数。实际 K 段体：A 用 4 条 LDS.128，每条取 4 个 float；B 用 16 条 LDS，各取 1 个。</p>
+<pre>同一线程、一个 K 段：
+读到的 float 操作数 = 4×4 + 16×1 = 32
+执行的 shared load 指令 = 4 + 16 = 20
+
+加载宽度改变了指令条数，保留了这些逻辑操作数。
+32 不能直接拿来替代 shared-load warp 指标中的每段指令数。</pre>
+<p>在 <a href="../labs/sgemm/result/20261019_205959_analysis/sass_and_resources.txt">原始导出</a> 中，shared 函数含 16 条 LDS、4 条 LDS.128、16 条 FFMA、2 条 BAR。内层 e 循环已经展开成这一段，外层 K 分块仍通过回边重复。搜到 20 行指令只能得到静态数；下一步才把执行次数乘进去。</p>
+<form class="exercise" data-retrieval data-correct="正确：20 条 shared load 与 32 个 float 操作数可以同时成立。LDS.128 合并了单线程的连续元素读取。" data-retry="指令数按 4+16；float 数按 4×4+16×1。不要把两个口径混在一起。"><p><strong>练习 4：</strong>每线程每段多少条 shared load，多少个 float 操作数？</p><label>指令 <input type="number" required data-answer="20"></label><label>float <input type="number" required data-answer="32"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form>
+<h3>5.3 · 从一个 warp 推到整个 grid</h3>
+<p>一个 block 有 256 个线程，即 8 个完整 warp；grid 为 64×64=4096 个 block；K=1024，一共 64 段。这个 kernel 的计算区没有 predicated LDS，且所有线程参与每段计算，故此例可按统一循环次数相乘。</p>
+<form class="exercise" data-retrieval data-correct="正确：4096 block × 8 warp/block × 64 段 × 20 load/warp/段 = 41,943,040 条动态 warp 指令。" data-retry="先数 grid=(1024/16)²，再乘 256/32、1024/16，最后乘每段 20。不要额外乘 32。"><p><strong>练习 5：</strong>先自己填四个中间量，再与报告核对。</p><label>block 数 <input type="number" required data-answer="4096"></label><label>warp/block <input type="number" required data-answer="8"></label><label>K 段数 <input type="number" required data-answer="64"></label><label>shared load 总数 <input type="number" required data-answer="41943040"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form>
+<details><summary>推导完成后再看：两个交叉核对</summary>
+<pre>shared load warp 指令 = 4096×8×64×20 = 41,943,040
+FFMA warp 指令        = 4096×8×64×16 = 33,554,432
+FFMA pred-on 线程指令 = 33,554,432×32 = 1,073,741,824
+数学模型              = M×N×K = 1024³ = 1,073,741,824
+常用 GEMM FLOP 口径    = 2×M×N×K；一条 FFMA 计两次浮点操作</pre>
+<p>如果误把 32 个源码读取当成 32 条 LDS，便会预测 67,108,864 条 warp load，与报告不符。这个偏差首先要求检查编译结果和单位，不是立即怀疑测量故障。</p></details>
+<h3>5.4 · 自己从旧 .ncu-rep 读出两个数</h3>
+<pre><code>$lessonReport = '.\labs\sgemm\result\20261019_210502_515_application_warm_f8fb2cb2\shared_m1024_n1024_k1024_run01.ncu-rep'
+&amp; 'C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.2.0\ncu.bat' --import $lessonReport --page raw --csv --metrics smsp__sass_inst_executed_op_shared_ld.sum,smsp__sass_thread_inst_executed_op_ffma_pred_on.sum</code></pre>
+<p><code>--import</code> 读取报告；<code>--page raw</code> 选择原始指标页；<code>--csv</code> 以表格文本输出；<code>--metrics</code> 限定两列。此命令不重新执行你的程序。备课已实际运行，得到 <code>41943040.000000</code> 与 <code>1073741824.000000</code>，和推导一致。</p>
+<p>课堂任务：先写预测，再运行命令，最后记录“预测 / 观察 / 差异解释”三行。若同一指标为 N/A、没有列，先核对报告是否包含该项；不能把缺失当作 0。</p>
+<p class="note">到这里可以确认：在这个编译版本与输入下，观察到的宽加载形式及动态读取计数吻合。还不能给 LDS.128 分配一个“贡献了多少微秒”的数值。</p>
+</section>
+
+<section id="gui"><h2>6 · 第一次打开 Nsight Compute：只走一条路线</h2>
+<p>本段是你亲手操作的练习。备课核查了本机 2025.2 随附手册中的页面与控件；没有代替你完成 GUI 操作。主阅读是 <a href="https://docs.nvidia.com/nsight-compute/NsightCompute/index.html#source-page">官方 Source Page</a>，在线最新版可能与本机菜单略有差异。</p>
+<pre><code>&amp; 'C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.2.0\ncu-ui.bat' '.\labs\sgemm\result\20261019_210502_515_application_warm_f8fb2cb2\shared_m1024_n1024_k1024_run01.ncu-rep'</code></pre>
+<p>若 GUI 未直接载入文件，启动 ncu-ui 后用 File → Open 选择上面的 .ncu-rep。打开已有报告后，按下面顺序：</p>
+<ol><li>在 Summary / 报告头确认当前结果是 <code>sgemm_shared</code>，block 为 (16,16,1)、grid 为 (64,64,1)。</li>
+<li>切到 <strong>Source</strong> 页，在 <strong>View</strong> 下拉选择 SASS，或 Source 与 SASS 的并排视图。</li>
+<li>选择 <code>kernels.cu</code> 和 shared 函数；定位 inner e 循环或搜索 <code>LDS.128</code>，点击两侧关联行，观察高亮范围。</li>
+<li>只找一组 LDS / LDS.128 / FFMA 和两道 BAR。优化使一行源码关联多条机器指令，机器顺序也可能交错。</li>
+<li>切到 <strong>Raw</strong> 页，搜索 shared-load 和 FFMA 的完整指标名，对照刚才的 CLI 结果。</li></ol>
+<p>如果源码显示 <strong>File Not Found</strong>，选择文件名并使用 <strong>Resolve</strong> 指向源码快照；如果显示 <strong>File Mismatch</strong>，也应回到匹配快照，别跳过版本核对。当前项目已用 <code>-lineinfo</code> 构建；不需要为了源码关联改成会影响优化的调试构建。</p>
+<p>如果没有 PTX 视图，不妨碍本节完成。可用视图取决于二进制中嵌入的信息，PTX 缺失不等于 SASS 缺失。<a href="../reference/cuda-sass-tools.html#gui">速查页</a>保留了这条导航路径。</p>
+<p><strong>特别检查：</strong>旧采集只指定了一组总量指标，没有专门请求逐 PC 的 SourceCounters / warp sampling。Source 页能显示 SASS，不代表同时拥有每条指令的 stall 样本；缺列、空白、N/A 都不能当作零等待。这节不为“把表填满”临时重采。</p>
+<details><summary>本机手册在哪里？</summary><p>在 Windows 文件管理器打开 <code>C:\Program Files\NVIDIA Corporation\Nsight Compute 2025.2.0\docs\NsightCompute\index.html</code>，查 Source Page；采样定义在同级 <code>ProfilingGuide\index.html</code>。本节 GUI 路线按该版本手册设计。</p></details>
+</section>
+
+<section id="reasoning"><h2>7 · 扩展半步：指令证据怎样进入性能判断？</h2>
+<h3>7.1 · 三个问题分别需要什么证据</h3>
+<div class="table-wrap"><table><thead><tr><th>问题</th><th>需要的证据</th><th>本节能到哪一步</th></tr></thead><tbody>
+<tr><td>是否减少预期工作？</td><td>源码模型 + SASS + 动态计数</td><td>本节主练习，能够核对</td></tr>
+<tr><td>整体是否更快？</td><td>相同口径的多次普通计时</td><td>读已有结果，练解释不确定性</td></tr>
+<tr><td>为什么影响时间？</td><td>依赖、资源、定向观测或控制实验</td><td>识别缺口，提出可区分的假设</td></tr>
+</tbody></table></div>
+<p>“20 条 load 比 32 个标量读取少”证明了编译层面的合并，不能直接预测时间按 20/32 缩短。宽指令、实际处理的 lane 地址、流水线能力、同步和依赖共同影响执行；bank wavefront、全局请求、DRAM 流量也是不同层级。一个 32 bit shared load 可以因地址模式产生不同处理量，一个宽 load 也不能直接等同一次物理事务。</p>
+<h3>7.2 · 从已有性能报告练一次有边界的解释</h3>
+<p><a href="../labs/sgemm/docs/性能指标汇总.md">已有报告</a>记录 shared → register 的 shared load 从 41,943,040 降至 20,971,520，普通 1024³ 均值从约 1.620 ms 降至 0.944 ms。可以说整体时间改善、相关通信工作减少有支持；第三版同时改变输出 tile 和线程内复用，不能把全部收益划归某个因素。</p>
+<p>课堂先自己回答：“下一步观测什么，才能更接近原因？”可考虑检查哪些 shared 指令变了、每输出对应多少动态指令、是否有独立累加链；这些都有明确对象。不要从完整指标表中随机挑一个百分比来解释。</p>
+<h3>7.3 · 热点与等待：加量部分的概念预告</h3>
+<p><strong>PC</strong> 是指令位置。warp sampling 会在若干时刻观察 warp 的调度状态，并关联指令位置；它不是给每条指令装一个秒表。将来即便看到一个 FFMA 附近有依赖等待样本，也应回查它消费的加载值或之前的累加结果，不能直接下结论“FFMA 算得慢”。<a href="https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#sampling">一手阅读：Profiling Guide，Warp Sampling</a>。</p>
+<p>本节只识别这个边界，不要求熟悉全部 stall 原因。如果以后真的做逐 PC 诊断，先查看本机支持和旧报告可用项，再决定小规模补采，而不是先承诺旧报告里一定有数据。</p>
+<h3>7.4 · 用一个已有区间理解小收益</h3>
+<p>128³ 的普通计时中，shared−register 的 95% 配对差值区间为 [-2.84,0.45] μs，跨过零。它支持“这批数据不足以稳定判断两者排序”，不证明“完全没效果”或“二者等效”。该区间以 10 轮近似独立差值为前提；同一进程内重复 300 次得到的平均值，不变成 300 个独立实验样本。</p>
+<p>未来做新微调时，先 A/A 看测量本身的波动，再考虑交错 A/B 或 AB/BA 形成配对差值。A/A 中 A 是同一版本重复测；A/B 中只改变一个目标因素。先写预测、独立轮次和停止条件，避免看到一点差异就不断挑最快样本。</p>
+<details><summary>讨论题反馈：区间跨零，下一步一定要继续测吗？</summary><p>不一定。先看这个小收益是否值得追、当前不确定性是否会改变决定、能否先选一个更大且可预测的工作量变化。若确需补测，事先约定批次数或精度目标；若仍不确定，就记录“待验证”。不要把无限加样本当作唯一进展。</p></details>
+<h3>7.5 · 三档结论写作</h3>
+<pre>已确认：本版本 shared 的每个 K 段有 4 条 LDS.128、16 条 LDS；
+        1024³ 的动态 shared-load warp 计数与 41,943,040 吻合。
+有支持：已有报告显示 register 版相关通信工作减少、整体更快。
+待验证：纯线程内复用贡献多少时间；哪个 PC 的等待处于关键路径。</pre>
+<p>“已确认”始终带着版本、输入和计数口径。下一项好观测，应能区分至少两个解释，而不只是再多一个数字。</p>
+</section>
+
+<section id="exit"><h2>8 · 收课：你独立完成一次迁移</h2>
+<p><strong>主练习：</strong>保持本二进制与 shared 配置不变，把 M=N=K 改成 512，只做纸面预测。给出 grid、每 block 的 warp 数、K 段数、shared-load warp 计数、pred-on 线程 FFMA 计数。这里没有声称已经对 512³ 重新采集这些指标。</p>
+<form class="exercise" data-retrieval data-correct="正确：grid=32×32、8 warp/block、32 段；load=1024×8×32×20=5,242,880；线程 FFMA=512³=134,217,728。尺寸各减半，总量变为 1/8。" data-retry="grid 每边 512/16；段数 512/16。shared load 乘每段 20 条，线程 FFMA 可按 MNK 交叉检查。"><label>block 总数 <input type="number" required data-answer="1024"></label><label>K 段数 <input type="number" required data-answer="32"></label><label>shared load <input type="number" required data-answer="5242880"></label><label>线程 FFMA <input type="number" required data-answer="134217728"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form>
+<p><strong>思考题：</strong>若尺寸是 1023×1009×1031，还能直接用 MNK 当作执行的线程 FFMA 吗？先解释，再展开。</p>
+<details><summary>尾部题反馈</summary><p>不能。这版通过补零保持全部线程执行完整 K tile，最后才裁剪写出；多出来的输出线程及 K 尾部仍做乘加。在保持这份 SASS 的前提下，shared-load 预测为 ceil(M/16)×ceil(N/16)×8×ceil(K/16)×20；这里是 64×64×8×65×20=42,598,400。pred-on 线程 FFMA 对应填充后的 1024×1024×1040=1,090,519,040，逻辑问题的常用 FLOP 分子仍可定义为 2MNK。不要把逻辑有效工作、实际执行工作和最后合法输出混成一个数。本题是模型推导，未补采运行。</p></details>
+<h3>完成标准与两次回忆</h3>
+<ol><li>关掉答案，口头解释源码、PTX、SASS、cubin 的关系。</li><li>自己找出 shared 函数，读懂一条 LDS.128、一条 FFMA 和一条带谓词的 BRA。</li><li>画出 LDS → FFMA → FFMA 的依赖，说明寄存器为何会改存别的值。</li><li>从 20 条静态 load 推出 41,943,040 条动态 warp load，再用旧报告核对。</li><li>写出一个已确认结论和一个待验证问题，不把指令变化直接换算成加速。</li></ol>
+<p>明天用 5 分钟，不开课件重算 512³；三天后用 5～10 分钟，重画寄存器依赖并解释尾部题。回忆卡住的地方就是下一次提问入口。</p>
+<p>把这三行发回聊天即可得到针对性反馈：<strong>① 我的一条指令翻译；② 我的计数公式；③ 我认为目前还不能证明的结论。</strong>下一节可根据实际卡点，继续练可靠计时或小规模定向观测；本节不预先把它记成你已掌握。</p>
+</section>
+<footer>主阅读：<a href="https://docs.nvidia.com/cuda/archive/12.8.1/cuda-binary-utilities/index.html#cuobjdump">CUDA Binary Utilities · cuobjdump</a>，只看工具输入与 dump-sass 示例；随后按需查 <a href="https://docs.nvidia.com/nsight-compute/NsightCompute/index.html#source-page">Source Page</a>。参考按本机版本校核，不要求通读官方手册。<br>2026-10-19 备课证据：读取源码与快照，核对 exe 哈希，实际导出 shared SASS，导入旧报告读取两项指标。没有新增 GPU 测量；GUI 由学习者按步骤实践。<br><a href="../reference/cuda-sass-tools.html">速查与公式</a> · <a href="../RESOURCES.md">课程资料来源</a> · <a href="#route">回到课程路线</a>。任何不清楚的术语或指令，都可以直接向老师追问。</footer>
+</main></body></html>

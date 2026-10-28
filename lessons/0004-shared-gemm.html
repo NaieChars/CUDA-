@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared-memory GEMM · CUDA 练习 04</title><link rel="stylesheet" href="../assets/teaching.css"><script defer src="../assets/retrieval.js"></script><script defer src="../assets/gemm-tiling.js"></script></head><body><main>
+<header><div class="eyebrow">CUDA LABS · 练习 04 · SGEMM MODE 1</div><h1>协作搬一块，复用十六次</h1><p class="lede">约 10～15 分钟。目标：保持一线程一个输出，把 K 循环改为 shared-memory tiling，独立处理加载分工、两道屏障与 M/N/K 尾部。</p><a href="0003-naive-gemm.html">上一课：朴素 GEMM</a> · <a href="../reference/sgemm-shared.html">速查与折叠答案</a> · <a href="../labs/sgemm/README.md">实验接口</a></header>
+<section id="reuse"><h2>先固定输出归属，再改变输入的供应方式</h2><p>仍然是 block=(16,16)，线程 (ty,tx) 负责 C[row,col]，row=blockIdx.y×16+ty，col=blockIdx.x×16+tx。它的私有 sum 从 0 开始，贯穿整个 K；不同线程不合并 sum。</p><p>固定一段长度 T=16 的 K，一个完整输出 tile 要做 T³ 次乘加。朴素版按源码逐个乘加读取两个输入，共 2T³=8192 次标量输入读取；协作版只需加载 A、B 各一个 T×T tile，共 2T²=512 个标量。每个 A 值供同一输出行的 16 个线程使用，每个 B 值供同一输出列的 16 个线程使用。</p><p class="note">这推导的是显式 global 标量读取次数，减少 16 倍；不是 DRAM 字节或加速比的承诺。缓存、warp 内重复地址处理、编译结果，以及新增 shared 读写和屏障都会影响实测。<a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab">官方案例也强调避免重复传输的价值</a>；本页数字按项目 T=16 推导。</p></section>
+<section id="mapping"><h2>同一个线程，有“搬运”和“计算”两个职责</h2><p>把 p=0…K−1 拆成 k0=0,16,32… 的段。每段，线程 (ty,tx) 先搬运两个元素，再从 shared 读取自己输出所需的一行和一列：</p>
+<div class="table-wrap"><table><thead><tr><th>职责</th><th>源 / 计算式</th><th>shared 偏移</th></tr></thead><tbody>
+<tr><td>搬 A</td><td>A[row,k0+tx]</td><td>As[ty×T+tx]</td></tr>
+<tr><td>搬 B</td><td>B[k0+ty,col]</td><td>Bs[ty×T+tx]</td></tr>
+<tr><td>算 C[row,col]</td><td>Σ As[ty,e] × Bs[e,tx]，e=0…T−1</td><td>ty×T+e 与 e×T+tx</td></tr>
+</tbody></table></div>
+<p>注意两个 K 坐标：搬 A 时用 tx，搬 B 时用 ty；计算时两者都用 e。搬 A/B 的线程无需就是最终使用它们的线程。这正是 block 协作的意义。<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#shared-memory">官方 tiled MatMulKernel</a>给出相同分工；本实验另外补齐尾部处理。</p>
+<pre>C 的一个输出 tile
+  += A[本 block 的行, 第一段 K] × B[第一段 K, 本 block 的列]
+  += A[本 block 的行, 第二段 K] × B[第二段 K, 本 block 的列]
+  += …</pre>
+<div class="exercise" data-gemm-tiling data-tile="2" data-a="[[1,2,3],[4,5,6],[7,8,9]]" data-b="[[1,0,2],[0,1,1],[2,1,0]]">
+<h3>缩到 T=2，观察 K=3 如何分两段</h3><p>A=[[1,2,3],[4,5,6],[7,8,9]]，B=[[1,0,2],[0,1,1],[2,1,0]]。下面只跟踪一个 block；每次点击表示整个 block 完成一个阶段，并非模拟 warp 调度。</p>
+<div class="demo-controls"><label>block 行 <select data-block-row aria-label="block 行"></select></label><label>block 列 <select data-block-col aria-label="block 列"></select></label></div>
+<div class="matrix-layout"><figure><figcaption>shared：As</figcaption><div data-tile-a></div></figure><figure><figcaption>shared：Bs</figcaption><div data-tile-b></div></figure><figure><figcaption>各线程私有 sum</figcaption><div data-sums></div></figure></div>
+<p role="status" aria-live="polite" class="feedback"></p><button type="button" data-step>载入下一段</button> <button type="button" data-reset>重置</button>
+<p>0* 表示越界补零；× 表示该线程不写 C。先观察左上 block：第一段后 sum=[[1,2],[4,5]]，第二段后变成 [[7,5],[16,11]]。再选右下 block，观察输出越界与 K 尾部同时发生时，加载和同步仍继续。</p><noscript><p>静态核对：左上 block 的 k0=2 时，As=[[3,0],[6,0]]，Bs=[[2,1],[0,0]]，乘积 [[6,3],[12,6]] 累加到上一段 sum。</p></noscript>
+</div></section>
+<section id="sync"><h2>两道屏障，保护两个不同方向的依赖</h2><pre>载入 As、Bs
+__syncthreads();      // 本段：先写完，才能让其他线程读
+读取 shared，做 T 次乘加
+__syncthreads();      // 跨段：先读完，才能让下一段覆盖
+回到下一段载入</pre><p>第一道防止某个 warp 读到尚未由其他 warp 写好的数据。第二道防止较快的 warp 提前写入下一段，覆盖较慢 warp 仍在使用的本段数据。warp 的执行进度不保证一致，下一段加载后的第一道屏障也无法修复已经发生的覆盖。</p><p>两道屏障都置于所有线程共同执行的 K 段循环里；不要把它们放进“输出有效”的分支。这里存在跨 warp 的数据依赖，不能直接换成 __syncwarp()。最后一段之后不再覆盖 shared，理论上无需第二道屏障；当前先统一保留，便于建立清晰的正确性结构。参见 <a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#synchronization-functions">block 屏障与可见性规则</a>。</p></section>
+<section id="tails"><h2>输出无效，不代表搬运任务无效</h2><p>朴素版的越界 return 在这里不能照搬。分别判断 A 与 B 的源坐标，每个 shared 槽位每段都必须写一次，有效则读 global，无效则写 0：</p><pre>A 有效：row &lt; m  且  k0 + tx &lt; k
+B 有效：k0 + ty &lt; k  且  col &lt; n
+C 有效：row &lt; m  且  col &lt; n（只用于最终写回）</pre><p>例如 T=16，M=17,N=19,K=18，blockIdx=(1,1)，threadIdx=(2,3)：输出是 C[19,18]，越界；但第一段要搬的 B[3,18] 有效，其他有效输出线程还要用它。提前退出会漏掉这次搬运。</p><p>K 尾段仍计算完整 T 项，用零消掉多余项。只跳过无效 global 读取而不写 shared，会残留上一段内容。例如 K=19 时第二段只有 3 个有效 K，另 13 项必须补零；sum 则不能在段间清零。</p>
+<form class="exercise" data-retrieval data-correct="正确：A 的 K 坐标为 19，越界补 0；B 的 K 坐标为 18，有效，偏移 18×23+19=433；总共两段 K，第二段有 3 个有效 K。" data-retry="先分清搬运时 A 用 k0+tx、B 用 k0+ty，再分别检查各自坐标。K=19 按 16 分段。"><p><strong>不看上表再推导：</strong>M=19,N=23,K=19，blockIdx=(1,0)，threadIdx=(3,2)，k0=16。A 是否有效（1/0）？B 的 global 偏移是多少？整个 K 共几段？尾段几个有效 K？</p><label>A 有效 <input type="number" required data-answer="0"></label><label>B 偏移 <input type="number" required data-answer="433"></label><label>段数 <input type="number" required data-answer="2"></label><label>尾段 K 数 <input type="number" required data-answer="3"></label><button type="submit">核对</button><p role="status" aria-live="polite" class="feedback"></p></form></section>
+<section id="code"><h2>现在补完 sgemm_shared</h2><p>框架已为 mode 1 预留 2×16×16×4=2048 字节动态 shared。用一个 extern 数组拆成 As/Bs，不必再申请两块静态 shared。只补 <code>labs/sgemm/src/kernels.cu</code> 中的 mode 1：</p>
+<pre><code>constexpr int T = sgemm_config::kSharedTile;
+extern __shared__ float smem[];
+float* as = smem;
+float* bs = smem + T * T;
+const size_t tx = threadIdx.x, ty = threadIdx.y;
+const size_t row = /* TODO：block 输出行 + ty */;
+const size_t col = /* TODO：block 输出列 + tx */;
+float sum = 0.0f;
+
+for (size_t k0 = 0; k0 &lt; k; k0 += T)
+{
+    as[ty * T + tx] = /* TODO：A 有效则加载，否则 0 */;
+    bs[ty * T + tx] = /* TODO：B 有效则加载，否则 0 */;
+    /* TODO：第一道屏障 */
+    for (int e = 0; e &lt; T; ++e)
+        sum += as[/* TODO */] * bs[/* TODO */];
+    /* TODO：第二道屏障 */
+}
+if (/* TODO：输出有效 */)
+    c[row * n + col] = sum;</code></pre>
+<p>完成后才将 kSharedImplemented 改为 true，register 版继续保持 false。<a href="../reference/sgemm-shared.html#implementation">完整答案仍折叠保存在速查页</a>。</p>
+<pre><code>cmake --build build --config Release --target sgemm --parallel 1
+.&#92;labs&#92;sgemm&#92;scripts&#92;run_benchmark.ps1 -Modes 0,1 -Shapes '1x1x1','3x5x7','15x17x19','16x16x16','17x19x23','31x33x29','32x32x33' -CheckOnly -Repeat 1 -SkipBuild</code></pre><p>检查覆盖极小矩阵、完整 tile、M/N/K 尾部及至少三段 K 的 shared 复用；普通数值通过不能单独证明无竞争，仍要按两道屏障的依赖关系检查代码。当前不计时；待 register 版完成再统一测性能。</p></section>
+<footer>完成标准：写对协作加载、段内乘加与尾部，并能解释第二道屏障的必要性。主阅读：<a href="https://docs.nvidia.com/cuda/archive/13.0.3/cuda-c-programming-guide/index.html#shared-memory">Programming Guide §6.2.4 的第二个 MatMulKernel</a>，重点看“加载→同步→计算→同步”；其整除假设不可照搬。下一课才让一个线程计算多个输出，进入 register tiling。<br><a href="../reference/sgemm-shared.html">速查</a> · <a href="../RESOURCES.md">资料</a>。任何推导不清楚，都可以在聊天中追问；尤其可以用你自己的时序解释来讨论第二道屏障。</footer>
+<p><a href="0005-register-gemm.html">下一课：Register tiling，一组操作数更新四个输出</a></p>
+</main></body></html>
